@@ -1,0 +1,25 @@
+[package]
+name = "kern-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kern tool system: Tool trait, registry, builtins, and execution limits."
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+jsonschema = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+kern-model = { path = "../kern-model" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mockito = { workspace = true }

@@ -1,0 +1,41 @@
+[package]
+name = "kern-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kern runtime core: lifecycle, engine, state, events, checkpoints, recovery, permissions, sandbox, scheduler, config, API."
+
+[dependencies]
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+serde_path_to_error = "0.1"
+chrono-tz = "0.10"
+cron = "0.12"
+axum = { workspace = true }
+tokio-stream = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+glob = { workspace = true }
+libc = { workspace = true }
+idna = { workspace = true }
+url = { workspace = true }
+kern-model = { path = "../kern-model" }
+kern-tool = { path = "../kern-tool" }
+
+[[bench]]
+name = "limits"
+harness = false
+
+[dev-dependencies]
+reqwest = { workspace = true }
+criterion = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

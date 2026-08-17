@@ -1,0 +1,29 @@
+[package]
+name = "kern-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kern CLI: daemon and control interface (SPEC.md §16)."
+
+[[bin]]
+name = "kern"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+kern-core = { path = "../kern-core" }
+kern-model = { path = "../kern-model" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
