@@ -8,6 +8,7 @@
 //! Exit codes (SPEC.md §16): `0` success, `1` runtime/client error, `2`
 //! usage error (clap).
 
+mod branding;
 mod client;
 mod daemon;
 mod doctor;
@@ -126,7 +127,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = Cli::command().before_help(branding::banner()).get_matches();
+    let cli = Cli::from_arg_matches(&cli).expect("clap should match");
     let code = match dispatch(cli).await {
         Ok(code) => code,
         Err(err) => {
