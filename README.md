@@ -3,106 +3,39 @@
 **The open-source runtime for reliable, long-running AI agents.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-v0.1.0--pre--release-orange" alt="Status">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/runtime-local--first-111111" alt="Local First">
-  <img src="https://img.shields.io/badge/AI-model--agnostic-111111" alt="Model Agnostic">
+  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
+  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status">
 </p>
 
-<p align="center">
-  <strong>Agents should run like software, not like prompts.</strong>
-</p>
-
-                         K E R N
-              ───────────────────────────
-
-                    ┌─────────────┐
-                    │    AGENT    │
-                    └──────┬──────┘
-                           │
-              ┌────────────▼────────────┐
-              │       KERN RUNTIME      │
-              │                         │
-              │  Execution   Scheduling │
-              │  State       Checkpoint │
-              │  Memory      Recovery   │
-              │  Tools       Security   │
-              │  Events      Networking │
-              └────────────┬────────────┘
-                           │
-             ┌─────────────┼─────────────┐
-             ▼             ▼             ▼
-          Models         Tools         System
-       ┌──────────┐   ┌──────────┐   ┌──────────┐
-       │ OpenAI   │   │ Files    │   │ Memory   │
-       │ Anthropic│   │ Network  │   │ Processes│
-       │ Ollama   │   │ HTTP     │   │ Sandbox  │
-       │ Mock     │   │ Shell*   │   │ Events   │
-       └──────────┘   └──────────┘   └──────────┘
-
-          One runtime. Durable execution.
-        (* shell tool disabled by default)
-
-Kern executes AI agents as durable software processes: execution, tools, state, memory,
+Kern executes AI agents as durable software processes. Execution, tools, state, memory,
 permissions, isolation, checkpoints, recovery, scheduling, and observability around the
 model. An agent that crashes, is killed, or whose machine restarts resumes from its last
 checkpoint instead of starting over.
 
-Today's agents are usually a single loop in an application process:
+---
 
-    prompt → model → tool → model → tool → done
+## Features
 
-That works for demos. It falls apart when an agent must run for hours, survive crashes,
-execute untrusted code, respect permissions, and report progress to another application.
-Kern treats those as **runtime problems**, not application problems.
+- **Durable Execution** -- Execution state, tool history, and checkpoints live in SQLite (WAL, crash-safe). Restarting Kern restores an agent from its last checkpoint and continues.
+
+- **Model Abstraction** -- A clean provider trait with raw-HTTP adapters: OpenAI, Anthropic, Ollama, and a deterministic mock for tests and demos.
+
+- **Tool System** -- First-class capabilities with name, description, input schema, permission requirements, and explicit results/errors. Builtins: filesystem, http, memory, sleep. Shell exists but is disabled by default for security.
+
+- **Security by Default** -- The model is never the security boundary. Every tool call passes a policy check (`allow` / `deny` / `ask`). `ask` pauses the agent in `waiting` until a human grants or denies through `kern permissions` + `kern grant`.
+
+- **Sandboxing** -- Platform-specific isolation, fail-closed. Linux: bubblewrap, landlock, rlimit fallback. macOS: sandbox-exec (seatbelt). Windows: none in v0.1.
+
+- **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE.
+
+- **Scheduling** -- Agents can run on an interval or cron schedule with crash-safe scheduling state.
 
 ---
 
-## Status
+## Quick Start
 
-Kern v0.1.0 is implemented and tested. Nothing below is claimed that is not exercised by
-the test suite (currently **318 tests**, including a SIGKILL recovery proof, a
-deterministic fault-injection matrix over every persisted-write boundary, a CLI
-integration suite that drives the real daemon, a redaction audit, state-corruption tests,
-seeded fuzz-lite tests, and real-provider smoke tests against a live OpenAI-compatible
-endpoint). Known limitations — no seccomp; landlock-only write containment where `bwrap`
-is absent (no network isolation; memory is capped only when
-`runtime.tool_memory_limit_mb` is set); no Anthropic/Ollama live coverage; unbounded
-event growth unless `KERN_EVENT_RETENTION` is set — are documented in
-`ARCHITECTURE.md §22`/§27.
-
-| Capability | Status | Where |
-|-----------|--------|-------|
-| Durable SQLite state (WAL, single file, schema v4) | ✅ shipped | `SPEC.md §5`, `ARCHITECTURE.md §3` |
-| Event system (catalog-pinned kinds, broadcast + persisted replay) | ✅ shipped | `SPEC.md §7`, `ARCHITECTURE.md §12` |
-| Declarative agent config (`agent.yaml`, schema v1, validated) | ✅ shipped | `SPEC.md §9` |
-| Agent lifecycle + engine loop (parallel tool batches, bounded history, execution budgets) | ✅ shipped | `SPEC.md §6`, `ARCHITECTURE.md §6–7, §24` |
-| Model gateway: OpenAI, Anthropic, Ollama, mock | ✅ shipped | `SPEC.md §10`, `ARCHITECTURE.md §8` |
-| Tool system + builtins (filesystem, http, shell-off-by-default, memory, sleep) | ✅ shipped | `SPEC.md §11`, `ARCHITECTURE.md §9` |
-| Permission engine (allow / deny / ask, approval TTL) | ✅ shipped | `ARCHITECTURE.md §10, §22.5` |
-| Sandboxing (bubblewrap, **landlock**, rlimit fallback, sandbox-exec; see matrix) | ✅ shipped | `SPEC.md §12`, `ARCHITECTURE.md §10.2, §17` |
-| Tool resource caps (timeout, output, **memory via `RLIMIT_AS`**) | ✅ shipped | `ARCHITECTURE.md §22.1, §27.4` |
-| Checkpointing + crash recovery (SIGKILL test + deterministic fault-injection matrix) | ✅ shipped | `SPEC.md §13`, `ARCHITECTURE.md §11, §27` |
-| Durable wake/sleep (runner-unloaded sleeps that survive restart) | ✅ shipped | `ARCHITECTURE.md §26` |
-| Supervisor (stuck/lost-runner detection, `RUNNER_LOST`) | ✅ shipped | `ARCHITECTURE.md §25.1` |
-| Scheduler (interval + cron + crash-loop backoff) | ✅ shipped | `SPEC.md §14`, `ARCHITECTURE.md §13, §24.4` |
-| Local HTTP API + SSE event streaming | ✅ shipped | `SPEC.md §15`, `ARCHITECTURE.md §12.3` |
-| CLI control interface (`kern ps`, `logs`, `inspect`, `doctor`, …) | ✅ shipped | `SPEC.md §16`, `ARCHITECTURE.md §12.4` |
-| Secret redaction in all log layers + scrubbed tool subprocess envs | ✅ shipped | `ARCHITECTURE.md §22.3, §22.5` |
-| Benchmarks (smoke targets) | ✅ shipped | README "Benchmarks" below |
-
-**Known limitations (honest, not hidden):** no seccomp filter yet; the Linux landlock/rlimit
-backends do not isolate the network (namespaces/bwrap do); macOS `sandbox-exec` is
-deprecated by Apple; Windows has no OS sandbox in v0.1 (fail-closed when sandbox is
-required); persisted event history is unbounded unless `KERN_EVENT_RETENTION` is set
-(warning at 100k events per agent — `ARCHITECTURE.md §22.2`).
-
----
-
-## Quickstart
-
-Requires Rust 1.90+ (stable, pinned in `rust-toolchain.toml`). Everything is local: no
-account, no cloud, no hosted database.
+Requires Rust 1.90+ (stable, pinned in `rust-toolchain.toml`). Everything is local: no account, no cloud, no hosted database.
 
 ```bash
 cargo build --release
@@ -118,9 +51,7 @@ In a second terminal:
 kern run agent.yaml --wait
 ```
 
-`kern init` scaffolds an agent that uses the **mock provider**, so the first run works with
-**zero API keys**. Switch the model provider in `agent.yaml` and set the matching key to use
-a real model:
+`kern init` scaffolds an agent that uses the **mock provider**, so the first run works with **zero API keys**. Switch the model provider in `agent.yaml` and set the matching key to use a real model:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -141,9 +72,9 @@ kern logs <agent>            # full event history survived
 
 ---
 
-## A Kern agent
+## Agent Configuration
 
-Agents are declarative. `agent.yaml` (schema v1, validated on load — see `SPEC.md §9`):
+Agents are declarative. `agent.yaml` (schema v1, validated on load):
 
 ```yaml
 version: 1
@@ -170,15 +101,13 @@ runtime:
     every: 1h
 ```
 
-The same definition runs anywhere — a laptop, a server, a future distributed Kern — without
-rewriting the agent.
+The same definition runs anywhere -- a laptop, a server, a future distributed Kern -- without rewriting the agent.
 
 ---
 
-## CLI
+## CLI Reference
 
-The CLI is a control interface to the runtime, not the runtime itself. It talks to the
-daemon's HTTP API and never touches the store directly.
+The CLI is a control interface to the runtime, not the runtime itself. It talks to the daemon's HTTP API and never touches the store directly.
 
 | Command | Purpose |
 |---------|---------|
@@ -197,67 +126,110 @@ daemon's HTTP API and never touches the store directly.
 
 ---
 
-## What Kern provides
+## Configuration
 
-**Durable execution.** Execution state, tool history, and checkpoints live in SQLite (WAL,
-crash-safe commits). Restarting Kern restores an agent from its last checkpoint and
-continues — never re-runs already-finished tool calls.
+### Runtime Environment Variables
 
-**Model abstraction.** A clean provider trait with raw-HTTP adapters (no SDKs): OpenAI,
-Anthropic, Ollama, and a deterministic mock for tests and demos.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KERN_HOME` | `~/.kern` | Data directory |
+| `KERN_API_ADDR` | `127.0.0.1:8787` | API bind address |
+| `KERN_TOKEN` | (token file) | API bearer token |
+| `KERN_LOG` | `info` | Tracing level |
+| `OPENAI_API_KEY` | -- | OpenAI provider |
+| `ANTHROPIC_API_KEY` | -- | Anthropic provider |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama provider |
 
-**Tools.** First-class capabilities with name, description, input schema (JSON-Schema
-validated), permission requirements, and explicit results/errors. Builtins: filesystem,
-http, memory; shell exists but is **disabled by default** for security.
+### Provider Configuration
 
-**Security by default.** The model is never the security boundary. Every tool call passes a
-policy check (`allow` / `deny` / `ask`). `ask` pauses the agent in `waiting` until a human
-grants or denies through `kern permissions` + `kern grant`. Secrets come from the
-environment only and are redacted from every log layer (audited by integration test).
-
-**Sandboxing.** Platform-specific isolation, fail-closed:
-
-| Platform | Backend | `sandbox: required` | `sandbox: best-effort` |
-|----------|---------|---------------------|------------------------|
-| Linux (with `bwrap`) | bubblewrap | namespaces, read-only root, writable workspace, rlimits, dropped caps, `--die-with-parent` | same |
-| Linux (no `bwrap`) | **landlock** (kernel LSM, Linux ≥ 5.13, no external binary) | read-everywhere, writes only in workspace + `/tmp`; rlimits; no network/memory isolation | same |
-| Linux (no `bwrap`, no landlock) | rlimit fallback | agent **fails to start** | CPU/FSIZE/NOFILE limits; no network/memory isolation |
-| macOS | `sandbox-exec` (seatbelt) | deny-default profile, no network | same; deprecated by Apple |
-| Windows | none in v0.1 | agent **fails to start** | no OS isolation (in-tool containment only) |
-
-No seccomp filter in v0.1; the filesystem and http tools enforce their own path/host
-constraints on every platform (defense in depth).
-
-**Observability.** Every meaningful action is a structured, persisted event — `agent.started`,
-`tool.requested`, `tool.completed`, `checkpoint.created`, `agent.paused`, `agent.completed` —
-queryable via the API and `kern logs`, streamed over SSE.
-
-**Scheduling.** Agents can run on an interval or cron schedule with crash-safe scheduling
-state.
-
----
-
-## Benchmarks
-
-Benchmarks in `crates/kern-core/benches/limits.rs` (dev profile, informational — not CI
-gates):
-
-| Target | Measured (dev profile) |
-|--------|------------------------|
-| Event append (persist + broadcast) | ~53 µs / event |
-| Checkpoint commit (full transaction) | ~67 µs |
-| One agent-loop turn (mock model, no tools) | ~4 ms |
+Set the appropriate API key for your provider:
 
 ```bash
-cargo bench --bench limits
+export OPENAI_API_KEY=sk-...        # for OpenAI
+export ANTHROPIC_API_KEY=sk-ant-...  # for Anthropic
+# Ollama requires no key; ensure it's running locally
 ```
-
-These are order-of-magnitude regression checks, not marketing numbers. Re-measure on
-release builds and real hardware before quoting them anywhere.
 
 ---
 
-## Project layout
+## Model Providers
+
+| Provider | Environment Variable | Notes |
+|----------|---------------------|-------|
+| OpenAI | `OPENAI_API_KEY` | GPT-4o, GPT-4o-mini, etc. |
+| Anthropic | `ANTHROPIC_API_KEY` | Claude models |
+| Ollama | -- | Local models via `OLLAMA_BASE_URL` |
+| Mock | -- | For tests and demos (no key required) |
+
+---
+
+## Tool System
+
+### Built-in Tools
+
+| Tool | Description | Default Permission |
+|------|-------------|-------------------|
+| `filesystem` | Read/write/list/stat files | Allow within configured roots |
+| `http` | GET/POST requests | Allow to configured hosts |
+| `memory` | Durable agent-scoped KV storage | Allow to configured keys |
+| `sleep` | Pause execution (for testing) | No permission required |
+| `shell` | Execute shell commands | Disabled by default (security) |
+
+### Security Model
+
+The model is never the security boundary. Every tool call passes through the permission engine:
+
+- **allow** -- Execute immediately
+- **deny** -- Reject, return error to model
+- **ask** -- Pause agent, wait for human approval via `kern grant`
+
+---
+
+## Sandboxing
+
+| Platform | Backend | Notes |
+|----------|---------|-------|
+| Linux (with `bwrap`) | bubblewrap | Full namespace isolation, read-only root, writable workspace |
+| Linux (no `bwrap`) | landlock | Kernel-enforced write containment (Linux >= 5.13) |
+| Linux (no `bwrap`, no landlock) | rlimit fallback | CPU/FSIZE/NOFILE limits only |
+| macOS | sandbox-exec | Seatbelt profile (deprecated by Apple) |
+| Windows | none | In-tool containment only (v0.1) |
+
+---
+
+## Durable Execution
+
+Execution state, tool history, and checkpoints live in SQLite (WAL, crash-safe commits). Restarting Kern restores an agent from its last checkpoint and continues -- never re-runs already-finished tool calls.
+
+### Recovery
+
+```bash
+kern run agent.yaml          # start an agent
+kern checkpoint <agent>      # create a checkpoint
+# kill -9 the daemon
+kern daemon                  # restart
+kern inspect <agent>         # agent is recovering
+kern resume <agent>          # picks up from checkpoint
+```
+
+---
+
+## Scheduling
+
+Agents can run on an interval or cron schedule:
+
+```yaml
+schedule:
+  every: 12h              # interval, OR
+  cron: "0 3 * * *"       # cron expression, OR
+  at: "2026-09-01T00:00:00Z"  # one-shot RFC3339
+  timezone: "UTC"         # optional, default UTC
+  skip_if_running: true   # optional, default true
+```
+
+---
+
+## Project Layout
 
 ```
 crates/
@@ -266,24 +238,39 @@ crates/
   kern-model/  model gateway: provider trait + OpenAI/Anthropic/Ollama/mock adapters
   kern-tool/   tool system: trait, registry, executor, builtins
   kern-cli/    the `kern` binary: init, daemon, and the control CLI
-ARCHITECTURE.md    why: design, decisions, limits audit
-SPEC.md            what (normative): DDL, event catalog, API contract, schemas
 ```
+
+---
 
 ## Development
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # unit + integration, incl. SIGKILL recovery proof
+cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo bench --bench limits      # optional smoke benchmarks
 ```
 
-New contributors: read [`CONTRIBUTING.md`](CONTRIBUTING.md) first (workflow, CI gates,
-review expectations). Tool authors: [`TOOL_AUTHORING.md`](TOOL_AUTHORING.md) has the `Tool`
-trait contract.
+New contributors: read [`CONTRIBUTING.md`](CONTRIBUTING.md) first.
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [README.md](README.md) | This file |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development workflow and contribution guidelines |
+| [Code of Conduct](CODE_OF_CONDUCT.md) | Community standards |
+| [SECURITY.md](SECURITY.md) | Vulnerability reporting |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Design decisions and rationale |
+| [SPEC.md](SPEC.md) | Normative contracts and schemas |
+| [TOOL_AUTHORING.md](TOOL_AUTHORING.md) | Tool trait contract and how to add tools |
+| [LICENSE](LICENSE) | Apache 2.0 license |
+
+---
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
