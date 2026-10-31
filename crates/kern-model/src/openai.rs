@@ -78,6 +78,200 @@ impl ModelProvider for OpenAiProvider {
 
         normalize(&payload)
     }
+
+    /// Stream the Chat Completions SSE stream (`stream: true`).
+    ///
+    /// Text deltas are forwarded as they arrive; tool-call fragments are
+    /// accumulated by `index` (the id and name arrive once, the arguments in
+    /// pieces). The turn is only complete once `[DONE]` — or the end of the
+    /// body — arrives, and the accumulated result is what the engine records.
+    async fn stream(
+        &self,
+        req: &CompletionRequest,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<CompletionResponse, ModelError> {
+        let key = self
+            .api_key
+            .as_deref()
+            .ok_or_else(|| ModelError::Auth("OPENAI_API_KEY is not set".to_string()))?;
+
+        let mut body = build_body(req);
+        body["stream"] = json!(true);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        let mut response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ModelError::Unavailable(format!("openai transport error: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(from_status(response.status(), "openai"));
+        }
+
+        let mut state = StreamState::default();
+        // Buffer BYTES, not a String: a chunk boundary can split a multi-byte
+        // character, and only complete lines are decoded.
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut total = 0usize;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ModelError::Unavailable(format!("openai stream transport error: {e}")))?
+        {
+            total += chunk.len();
+            if total as u64 > MAX_RESPONSE_BYTES {
+                return Err(ModelError::InvalidResponse(format!(
+                    "openai stream exceeds {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim().strip_prefix("data:") else {
+                    continue; // blank lines, comments, event: fields
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    return state.finish();
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                let event: Value = serde_json::from_str(data).map_err(|e| {
+                    ModelError::InvalidResponse(format!("openai stream event is not JSON: {e}"))
+                })?;
+                if let Some(error) = event.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stream error");
+                    return Err(ModelError::Unavailable(format!(
+                        "openai stream error: {message}"
+                    )));
+                }
+                state.apply(&event, deltas)?;
+            }
+        }
+        // A body that ends without `[DONE]` is still a complete turn.
+        state.finish()
+    }
+}
+
+/// Accumulates a Chat Completions stream into one normalized response.
+#[derive(Default)]
+struct StreamState {
+    text: String,
+    tool_calls: Vec<PartialToolCall>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl StreamState {
+    fn apply(
+        &mut self,
+        event: &Value,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<(), ModelError> {
+        // Usage-only chunks carry no choices.
+        let Some(choice) = event.pointer("/choices/0") else {
+            return Ok(());
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.text.push_str(text);
+                    crate::provider::emit_delta(deltas, text);
+                }
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    while self.tool_calls.len() <= index {
+                        self.tool_calls.push(PartialToolCall::default());
+                    }
+                    let slot = &mut self.tool_calls[index];
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        if !id.is_empty() {
+                            slot.id = id.to_string();
+                        }
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            // The name arrives once; gateways that repeat it are
+                            // tolerated by only taking the first non-empty value.
+                            if slot.name.is_empty() {
+                                slot.name = name.to_string();
+                            }
+                        }
+                        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+                            slot.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<CompletionResponse, ModelError> {
+        let calls: Vec<&PartialToolCall> = self
+            .tool_calls
+            .iter()
+            .filter(|c| !c.name.is_empty())
+            .collect();
+        if !calls.is_empty() {
+            let mut parsed = Vec::with_capacity(calls.len());
+            for (i, partial) in calls.iter().enumerate() {
+                let arguments: Value = if partial.arguments.trim().is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str(&partial.arguments).map_err(|e| {
+                        ModelError::InvalidResponse(format!(
+                            "tool call arguments are not valid JSON: {e}"
+                        ))
+                    })?
+                };
+                if !arguments.is_object() {
+                    return Err(ModelError::InvalidResponse(
+                        "tool call arguments must be a JSON object".to_string(),
+                    ));
+                }
+                parsed.push(ToolCall {
+                    id: if partial.id.is_empty() {
+                        format!("call_{i}")
+                    } else {
+                        partial.id.clone()
+                    },
+                    name: partial.name.clone(),
+                    arguments,
+                });
+            }
+            return Ok(CompletionResponse::ToolCalls(parsed));
+        }
+        let reason = match self.finish_reason.as_deref() {
+            Some("length") => FinishReason::Length,
+            Some("stop") | None => FinishReason::Stop,
+            Some(other) => FinishReason::Other(other.to_string()),
+        };
+        Ok(CompletionResponse::Finish {
+            reason,
+            text: self.text,
+        })
+    }
 }
 
 /// Serialize a normalized request into the OpenAI Chat Completions body.
@@ -330,6 +524,99 @@ mod tests {
         let provider = OpenAiProvider::new(format!("{}/v1", server.url()), Some("test-key".into()));
         provider.complete(&r).await.unwrap();
         mock.assert();
+    }
+
+    /// A real SSE body: text deltas, then a tool call whose id/name arrive
+    /// once and whose arguments arrive in pieces.
+    const SSE_TEXT_AND_TOOL_CALLS: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo!\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"filesystem\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn stream_forwards_text_deltas_and_assembles_tool_calls() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({ "stream": true }).to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(SSE_TEXT_AND_TOOL_CALLS)
+            .create();
+
+        let provider = OpenAiProvider::new(format!("{}/v1", server.url()), Some("k".into()));
+        let (delta_tx, mut delta_rx) = crate::provider::delta_channel();
+        let response = provider.stream(&req(), &delta_tx).await.unwrap();
+        drop(delta_tx);
+        let mut deltas: Vec<String> = Vec::new();
+        while let Some(text) = delta_rx.recv().await {
+            deltas.push(text);
+        }
+
+        assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
+        match response {
+            CompletionResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_a");
+                assert_eq!(calls[0].name, "filesystem");
+                assert_eq!(calls[0].arguments["path"], "/tmp/x");
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn stream_without_tool_calls_finishes_with_the_joined_text() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                ": keep-alive comment\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ))
+            .create();
+
+        let provider = OpenAiProvider::new(format!("{}/v1", server.url()), Some("k".into()));
+        let (delta_tx, mut delta_rx) = crate::provider::delta_channel();
+        let response = provider.stream(&req(), &delta_tx).await.unwrap();
+        drop(delta_tx);
+        let mut seen = String::new();
+        while let Some(text) = delta_rx.recv().await {
+            seen.push_str(&text);
+        }
+        assert_eq!(seen, "done");
+        match response {
+            CompletionResponse::Finish { reason, text } => {
+                assert_eq!(reason, FinishReason::Stop);
+                assert_eq!(text, "done");
+            }
+            other => panic!("expected finish, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_event_is_a_provider_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"error\":{\"message\":\"overloaded\"}}\n\n")
+            .create();
+        let provider = OpenAiProvider::new(format!("{}/v1", server.url()), Some("k".into()));
+        let (delta_tx, _delta_rx) = crate::provider::delta_channel();
+        let err = provider.stream(&req(), &delta_tx).await.unwrap_err();
+        assert!(matches!(err, ModelError::Unavailable(_)), "{err:?}");
+        assert!(err.to_string().contains("overloaded"), "{err}");
     }
 
     #[tokio::test]

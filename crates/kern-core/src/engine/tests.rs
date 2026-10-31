@@ -1311,3 +1311,65 @@ async fn wake_resumes_and_replays_the_recorded_sleep() {
         .unwrap();
     assert_eq!(completed.status, ExecutionStatus::Completed);
 }
+
+/// Streaming (`runtime.stream: true`): text fragments are broadcast live as
+/// transient `model.delta` events (seq 0) and are **never** persisted — the
+/// durable record stays the turn-based one (ARCHITECTURE §29).
+#[tokio::test]
+async fn streaming_broadcasts_deltas_without_persisting_them() {
+    let env = TestEnv::new(vec![ScriptedStep::Finish(
+        "streamed response text".to_string(),
+    )]);
+    let agent_id = env.create_agent(
+        "version: 1\nname: streamer\nmodel:\n  provider: mock\n  model: test\n\
+         tools: [noop]\nruntime:\n  stream: true\n",
+    );
+
+    let mut sub = env.bus.subscribe();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let forward = tokio::spawn(async move {
+        while let Ok(event) = sub.recv().await {
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    env.engine.start_agent(&agent_id, None).await.unwrap();
+    wait_for_state(&env.store, &agent_id, LifecycleState::Completed).await;
+
+    // Collect live events up to (and including) the run's final event.
+    let mut live = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        let finished = event.kind == "agent.completed";
+        live.push(event);
+        if finished {
+            break;
+        }
+    }
+    forward.abort();
+
+    let deltas: Vec<&str> = live
+        .iter()
+        .filter(|e| e.kind == "model.delta")
+        .map(|e| {
+            assert_eq!(e.seq, 0, "a delta is transient by construction");
+            e.payload["text"].as_str().unwrap_or("")
+        })
+        .collect();
+    assert!(
+        deltas.len() > 1,
+        "the mock streams in chunks, got {deltas:?}"
+    );
+    assert_eq!(deltas.concat(), "streamed response text");
+
+    // Durable record: no delta rows, and the turn itself is recorded normally.
+    let persisted = env.kinds();
+    assert!(
+        !persisted.iter().any(|k| k == "model.delta"),
+        "deltas must never be persisted: {persisted:?}"
+    );
+    assert!(persisted.iter().any(|k| k == "model.completed"));
+    assert!(persisted.iter().any(|k| k == "agent.completed"));
+}

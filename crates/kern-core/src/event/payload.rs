@@ -152,6 +152,16 @@ pub fn model_requested(provider: &str, model: &str, step: u64) -> Value {
     json!({ "provider": provider, "model": model, "step": step })
 }
 
+/// A live text fragment (`model.delta`, broadcast-only — never persisted).
+pub fn model_delta(provider: &str, model: &str, step: u64, text: &str) -> Value {
+    json!({
+        "provider": provider,
+        "model": model,
+        "step": step,
+        "text": text,
+    })
+}
+
 pub fn model_completed(
     provider: &str,
     model: &str,
