@@ -3,9 +3,11 @@
 //! `run_captured` owns the process-lifecycle contract (SPEC.md §11.1/§11.3):
 //!
 //! - **Kill-on-drop, tree-wide:** the child is spawned in its own process
-//!   group (unix). A guard's `Drop` sends `SIGKILL` to the whole group, so a
+//!   group on unix and into a job object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+//!   on Windows. A guard's `Drop` sends `SIGKILL` to the whole group /
+//!   `TerminateJobObject` to the job, so a
 //!   backgrounded grandchild (`sh -c 'sleep 1000 &'`) cannot outlive the
-//!   tool call. The future may be cancelled by the executor's `tool_timeout`
+//!   tool call on either platform. The future may be cancelled by the executor's `tool_timeout`
 //!   or daemon shutdown at any point; dropping the future MUST kill the
 //!   child **and its descendants**, never leak a stray process.
 //!   `tokio::process::Child` alone does NOT kill on drop, so the guard is
@@ -40,10 +42,11 @@ pub const DEFAULT_OUTPUT_CAP: usize = 1024 * 1024;
 pub struct RunLimits {
     pub timeout: Duration,
     pub output_cap: usize,
-    /// Address-space cap in bytes for the tool process: enforced
-    /// as `RLIMIT_AS` by the sandbox backends that apply rlimits (bwrap,
-    /// landlock, rlimits). `None` = no memory cap (the default — a memory
-    /// limit is an explicit per-agent operator choice).
+    /// Address-space cap in bytes for the tool process: enforced as
+    /// `RLIMIT_AS` by the sandbox backends that apply rlimits (bwrap,
+    /// landlock, rlimits), and as the job-object `ProcessMemoryLimit` on
+    /// Windows. `None` = no memory cap (the default — a memory limit is an
+    /// explicit per-agent operator choice).
     pub memory_limit_bytes: Option<u64>,
 }
 
@@ -78,20 +81,173 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-/// A child that is always killed (tree-wide) when dropped (see module docs).
-struct ChildGuard(Child);
+/// The Windows process-tree primitive: an unnamed job object per captured
+/// run. Closing the last handle terminates every process still inside it,
+/// which is the job-object equivalent of the unix process-group `SIGKILL`.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::size_of;
 
-impl ChildGuard {
-    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.wait().await
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    /// An owned job-object handle.
+    ///
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means Drop is load-bearing: it
+    /// terminates any surviving member (grandchildren included) when the
+    /// handle closes. `ProcessMemoryLimit` adds the address-space cap that
+    /// `RLIMIT_AS` provides on unix.
+    pub struct JobObject(HANDLE);
+
+    // SAFETY: a job-object handle is a kernel handle with no thread
+    // affinity; every operation here is a thread-safe kernel call.
+    unsafe impl Send for JobObject {}
+    unsafe impl Sync for JobObject {}
+
+    impl JobObject {
+        pub fn create(memory_limit: Option<u64>) -> io::Result<Self> {
+            // SAFETY: null security attributes and an unnamed job object.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let job = Self(handle);
+            // SAFETY: the extended-limit struct is plain old data; zeroing is
+            // its empty configuration.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(bytes) = memory_limit {
+                info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit = bytes.min(usize::MAX as u64) as usize;
+            }
+            // SAFETY: `info` outlives the call and the declared size matches
+            // the struct SetInformationJobObject reads.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const c_void,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                // `job` drops here and closes the handle.
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+
+        /// Move `pid` into the job. Called immediately after spawn; the narrow
+        /// pre-assignment window is a documented limitation (ARCHITECTURE §22).
+        pub fn assign(&self, pid: u32) -> io::Result<()> {
+            // SAFETY: plain handle acquisition; the process handle is closed
+            // exactly once below.
+            let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+            if process.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let ok = unsafe { AssignProcessToJobObject(self.0, process) };
+            let err = io::Error::last_os_error();
+            // SAFETY: `process` is owned by this scope and not used again.
+            unsafe { CloseHandle(process) };
+            if ok == 0 {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Terminate every process in the job.
+        pub fn terminate(&self) {
+            // SAFETY: valid job handle; a failure only means the job is empty.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
     }
 
-    /// Kill the direct child, then its whole process group. `start_kill` is
-    /// sync (unlike `kill`), so this is safe in `Drop`.
-    fn kill_tree(&mut self) {
-        let _ = self.0.start_kill();
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            // SAFETY: the handle is owned here and closed exactly once.
+            // KILL_ON_JOB_CLOSE terminates any surviving member at this point.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// A child that is always killed (tree-wide) when dropped (see module docs).
+struct ChildGuard {
+    child: Child,
+    /// Windows: the job owning this run's process tree.
+    #[cfg(windows)]
+    job: Option<job::JobObject>,
+}
+
+impl ChildGuard {
+    /// Spawn `cmd` into a fresh process group (unix) or job object (Windows),
+    /// so `kill_tree` can reach every descendant.
+    fn spawn(mut cmd: Command, memory_limit: Option<u64>) -> std::io::Result<Self> {
         #[cfg(unix)]
-        if let Some(pid) = self.0.id() {
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        #[cfg(unix)]
+        let _ = memory_limit;
+        #[cfg(windows)]
+        let job = Self::attach_job(&child, memory_limit);
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    /// Best-effort job assignment: a failure is logged and the run proceeds
+    /// with direct-child-only termination (never a failed tool call).
+    #[cfg(windows)]
+    fn attach_job(child: &Child, memory_limit: Option<u64>) -> Option<job::JobObject> {
+        let job = match job::JobObject::create(memory_limit) {
+            Ok(job) => job,
+            Err(err) => {
+                tracing::warn!(%err, "job object unavailable; a timed-out tool can only kill its direct child");
+                return None;
+            }
+        };
+        let Some(pid) = child.id() else {
+            // Exited before assignment: nothing left to contain.
+            return Some(job);
+        };
+        if let Err(err) = job.assign(pid) {
+            tracing::warn!(
+                %err,
+                pid,
+                "could not assign the tool process to its job object; grandchild kill is best-effort"
+            );
+            return None;
+        }
+        Some(job)
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    /// Kill the direct child and its entire tree. `start_kill` is sync (unlike
+    /// `kill`), so this is safe in `Drop`.
+    fn kill_tree(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+        let _ = self.child.start_kill();
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
             kill_process_group(pid);
         }
     }
@@ -112,21 +268,17 @@ pub async fn run_captured(
     limits: &RunLimits,
 ) -> Result<CommandOutput, ToolError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    // Put the child in its own process group so the whole tree (including
-    // backgrounded grandchildren) can be killed atomically.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = ChildGuard(
-        cmd.spawn()
-            .map_err(|e| ToolError::Failed(format!("spawn failed: {e}")))?,
-    );
+    // Spawns into its own process group / job object so the whole tree
+    // (including backgrounded grandchildren) can be killed atomically.
+    let mut child = ChildGuard::spawn(cmd, limits.memory_limit_bytes)
+        .map_err(|e| ToolError::Failed(format!("spawn failed: {e}")))?;
     let stdout = child
-        .0
+        .child
         .stdout
         .take()
         .expect("stdout must be piped before spawn");
     let stderr = child
-        .0
+        .child
         .stderr
         .take()
         .expect("stderr must be piped before spawn");
@@ -304,8 +456,8 @@ mod tests {
         // so poll `kill -0` (which succeeds on zombies) until it fails.
         let mut cmd = sh_cmd("sleep 30");
         piped(&mut cmd);
-        let child = ChildGuard(cmd.spawn().expect("spawn must succeed; sh is present"));
-        let pid = child.0.id().expect("spawned child has a pid");
+        let child = ChildGuard::spawn(cmd, None).expect("spawn must succeed; sh is present");
+        let pid = child.child.id().expect("spawned child has a pid");
         drop(child);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -376,5 +528,78 @@ mod tests {
             gone,
             "backgrounded grandchild {pid} must be killed with the process group"
         );
+    }
+
+    /// On Windows the job object is the tree killer: cmd.exe starts
+    /// PowerShell, which starts `ping` — a grandchild of our direct child — and
+    /// publishes its pid. A tool timeout must take the whole job down;
+    /// killing only cmd.exe would leave `ping` running.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn background_grandchild_is_killed_on_timeout_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        // `-NoNewWindow` keeps Start-Process on the CreateProcess path, so
+        // `ping` is a real child of PowerShell. `-WindowStyle` would route
+        // through ShellExecute, and the shell (outside our job) would create it.
+        let script = format!(
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','120','127.0.0.1' \
+             -NoNewWindow -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; \
+             Wait-Process -Id $p.Id",
+            pidfile.display()
+        );
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C")
+            .arg("powershell")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(&script);
+        piped(&mut cmd);
+        // Generous: PowerShell startup plus Start-Process must publish the pid
+        // before the timeout fires, or the assertion below cannot run.
+        let limits = RunLimits {
+            timeout: Duration::from_secs(8),
+            ..RunLimits::default()
+        };
+        let err = run_captured(cmd, &limits).await.unwrap_err();
+        assert_eq!(err.code(), "TOOL_TIMEOUT");
+
+        let mut pid = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(raw) = std::fs::read_to_string(&pidfile) {
+                pid = raw.trim().parse::<u32>().ok();
+                if pid.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("grandchild must have published its pid before the timeout");
+        assert!(
+            !process_alive(pid),
+            "grandchild {pid} must be terminated with the job object"
+        );
+    }
+
+    /// A synchronize handle is signaled as soon as the process exits, so this
+    /// has no zombie ambiguity (the Windows analogue of `kill -0`).
+    #[cfg(windows)]
+    fn process_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        // SAFETY: plain handle query; the handle is closed exactly once.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let state = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            state != WAIT_OBJECT_0
+        }
     }
 }

@@ -48,7 +48,7 @@ application loop. It is the runtime layer underneath agents.
 | D4 | Versioned JSON for checkpoints & state payloads | Human-inspectable, debuggable, trivially versionable; binary formats deferred until needed. |
 | D5 | Tool calls are **effectively-once** (at-least-once execution + result dedup) | Exactly-once is not generally achievable for side-effecting tools; dedup by tool-call id prevents double execution of recorded results. |
 | D6 | `deny` by default; explicit allow/ask policy | Model output is untrusted; the runtime is the security boundary. Fail closed. |
-| D7 | Sandbox backends per OS, fail-closed when required sandboxing is unavailable | Honest, documented security posture (Linux: bubblewrap, rlimit fallback for best-effort; macOS: seatbelt, deprecated+untested-on-CI; Windows: none in v0.1 — job objects deferred). |
+| D7 | Sandbox backends per OS, fail-closed when required sandboxing is unavailable | Honest, documented security posture (Linux: bubblewrap, rlimit fallback for best-effort; macOS: seatbelt, deprecated+untested-on-CI; Windows: job-object process-tree containment + optional memory cap only — no filesystem/network isolation, so `required` still fails closed; restricted tokens deferred). |
 | D8 | Local HTTP/JSON API on `127.0.0.1` + SSE; CLI is a thin client | Cross-platform, simple, stable interface; matches "CLI is a control interface, not the runtime". |
 | D9 | One async task per running agent; bounded concurrency | No unbounded concurrency; backpressure is explicit. |
 | D10 | Provider adapters use raw HTTP via `reqwest` (no provider SDKs) | Keeps dependencies intentional, gives full control over timeouts/retries/errors, easy fixture testing. |
@@ -578,8 +578,7 @@ authorization.
 | Linux | `bubblewrap` (`bwrap`) when installed | unshared namespaces (net/pid/mount/ipc/uts), read-only root with writable workspace, rlimits, dropped capabilities, `--die-with-parent`. No seccomp filter in v0.1 (documented). |
 | Linux (no bwrap) | rlimits fallback (`best-effort` only) | CPU/FSIZE/NOFILE limits in the child; no network or memory isolation. If an agent requires `shell` with `sandbox: required`, the agent **fails to start** with `SandboxError::Unavailable`. Fail closed. |
 | macOS | `sandbox-exec` (seatbelt) | deny-default profile: read-only root except workspace, no network; `sandbox-exec` is deprecated by Apple and untested on CI — documented as such. |
-| Windows | none in v0.1 | `sandbox: required` fails closed; `best-effort` logs the limitation and continues without OS isolation (in-tool containment only). Job objects + restricted tokens are deferred. |
-| Windows | Job objects + restricted tokens | process limits + restricted token; documented as the weakest backend in v0.1 |
+| Windows | job objects (one per tool call) | The tool's process tree lives in an unnamed job object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, plus `ProcessMemoryLimit` from `runtime.tool_memory_limit_mb`): timeout, cancel, or drop terminates the **whole tree**, so a backgrounded grandchild cannot outlive the call. Job objects give **no filesystem or network isolation**, so `sandbox: required` still fails closed; `best-effort` logs the limitation. Restricted tokens and FS containment remain deferred. |
 
 Honesty requirement: `SPEC.md §Sandbox` and the README must state exactly what each backend
 does and does not contain. We never claim a boundary that is not enforced.
@@ -825,15 +824,23 @@ Threat model summary and per-OS sandbox limitations are documented in `SPEC.md �
 | Capability | Linux | macOS | Windows |
 |-----------|-------|-------|---------|
 | Core runtime (lifecycle, engine, state, events, API, CLI) | ✅ | ✅ | ✅ |
-| Sandbox backend | `bwrap` (namespaces) → `landlock` (kernel LSM, Linux ≥ 5.13) → rlimits; `required` fails closed when no tier is available | seatbelt (deprecated, documented) | none in v0.1 (`required` fails closed) |
-| Shell tool | sandboxed (tier above) | sandboxed | in-tool containment only |
+| Sandbox backend | `bwrap` (namespaces) → `landlock` (kernel LSM, Linux ≥ 5.13) → rlimits; `required` fails closed when no tier is available | seatbelt (deprecated, documented) | job objects (process-tree containment + memory cap only, no fs/net isolation; `required` fails closed) |
+| Shell tool | sandboxed (tier above) | sandboxed | in-tool containment + job-object tree kill |
 | Filesystem/http tools | enforced in-tool on all platforms | same | same |
-| Tool process limits | CPU/FSIZE/NOFILE rlimits on every tier; `RLIMIT_AS` when `runtime.tool_memory_limit_mb` is set | n/a | n/a |
+| Tool process limits | CPU/FSIZE/NOFILE rlimits on every tier; `RLIMIT_AS` when `runtime.tool_memory_limit_mb` is set | n/a | job-object `ProcessMemoryLimit` when `runtime.tool_memory_limit_mb` is set |
+| Tool tree kill on timeout/cancel/drop | process group `SIGKILL` | process group `SIGKILL` | job object `TerminateJobObject` / `KILL_ON_JOB_CLOSE` |
 | Network isolation | bwrap only (netns) | seatbelt deny-network | none |
 | Credential boundary | scrubbed env allowlist, every tier | same | same |
 
-Platform-specific code lives behind `#[cfg(target_os)]` in `kern-core::sandbox`; everything
-else is portable. Honest limitation notes ship in the README.
+Platform-specific code lives behind `#[cfg(target_os)]` in `kern-core::sandbox` (isolation
+backends) and `kern-tool::process` (process-tree containment: unix process groups, Windows job
+objects); everything else is portable. Honest limitation notes ship in the README.
+
+Windows job objects are assigned immediately **after** `CreateProcess` (there is no portable
+`Command` seam for `PROC_THREAD_ATTRIBUTE_JOB_LIST`), so a process spawned and re-spawned within
+that microsecond window could escape containment. The window is documented rather than hidden;
+a failed assignment is logged and the run degrades to direct-child kill, never to a failed tool
+call.
 
 ---
 
@@ -944,11 +951,10 @@ deliberately honest about what v0.1 does **not** bound.
 
 ### 22.2 Known unbounded surfaces (documented, not hidden)
 
-1. **Persisted events are not pruned.** The store tallies per-agent events and emits a warning
-   at 100 000 (`WARN_EVENTS_PER_AGENT`), but v0.1 has no event-retention pruning. A very
-   long-lived agent will grow the DB unboundedly. Mitigation: retention pruning is a small,
-   isolated extension point in `store`; until it exists, operators can archive/trim the
-   `events` table manually. Flagged for v0.2.
+1. ~~Persisted events are not pruned.~~ **Bounded when configured:** `Store::prune_events`
+   keeps the newest N events per agent and `KERN_EVENT_RETENTION` runs it at daemon start and
+   every 6 h (§22.5). Unbounded remains the default (the store still warns at 100 000 events
+   per agent); operators who care set the knob.
 2. **SSE client connections are unbounded in count.** Each is a read-only stream; the loopback
    deployment model makes this acceptable, but a shared multi-tenant host should cap it.
 3. **No seccomp filter.** The sandbox matrix (§17) already states this; rlimit fallback does
@@ -998,6 +1004,15 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 5. **Provider integration tests.** `kern-model/tests/real_provider.rs` runs against a
    live OpenAI-compatible endpoint when `AGENTROUTER_API_KEY` is set (self-skips
    otherwise); `scripts/provider-smoke.sh` drives it.
+6. **Windows job objects (tool tree containment).** Windows tools could previously kill only
+   their direct child, so `cmd /c start …` left a grandchild running past a timeout. Every
+   captured tool run now spawns into an unnamed job object
+   (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, plus `ProcessMemoryLimit` when
+   `runtime.tool_memory_limit_mb` is set), so timeout / cancel / drop terminates the whole
+   tree — the Windows analogue of the unix process-group `SIGKILL`. Honest limits: job objects
+   isolate **nothing** on the filesystem or the network (`sandbox: required` still fails closed
+   on Windows), assignment happens just after spawn (§17), and a failed assignment degrades to
+   direct-child kill with a warning rather than failing the call.
 
 ---
 
@@ -1006,8 +1021,9 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 | ID | Decision |
 |----|----------|
 | D25 | `redact()` is wired into both tracing layers; the daemon writes `logs/runtime.jsonl`; redaction integration test; criterion benchmarks on the dev profile (HTML reports off); unbounded surfaces above documented rather than silently accepted |
-| D26 | Engine passes `host[:port]` (default from scheme) so port-scoped network rules are enforceable (port-less rules still match any port); permission decisions are CAS'd on `pending` (conflicting replay → `PERMISSION_REQUEST_ALREADY_DECIDED` 409, same-decision replay idempotent); shell children spawn in a process group and are killed group-wide on drop/timeout (unix; Windows Job Objects deferred); bracketed IPv6 host rules are exact-host syntax, not globs; API preserves 413 for oversized bodies (`REQUEST_TOO_LARGE`) |
+| D26 | Engine passes `host[:port]` (default from scheme) so port-scoped network rules are enforceable (port-less rules still match any port); permission decisions are CAS'd on `pending` (conflicting replay → `PERMISSION_REQUEST_ALREADY_DECIDED` 409, same-decision replay idempotent); shell children are tree-killed on drop/timeout — process group on unix, job object on Windows (D29); bracketed IPv6 host rules are exact-host syntax, not globs; API preserves 413 for oversized bodies (`REQUEST_TOO_LARGE`) |
 | D27 | Linux sandbox tier gains `landlock` (kernel LSM write containment, empirically probed ABI mask; no-`bwrap` `required` works on Linux ≥ 5.13); tool subprocess envs are scrubbed to a non-secret allowlist for every backend (credential boundary); approval TTL via schema v2 (`expires_at` + `PERMISSION_REQUEST_EXPIRED`, expired ≡ denied); opt-in event retention (`KERN_EVENT_RETENTION`); gated real-provider tests (`AGENTROUTER_API_KEY`, self-skipping). Deferred items (routing → app layer, no streaming in v0.1, MCP/agent-to-agent/SDK post-v0.1) are recorded in §19 and §25.3 |
+| D29 | Windows tool containment is a per-run job object in the transport layer (`kern-tool::process`), not a `kern-core::sandbox` backend: `KILL_ON_JOB_CLOSE` + optional `ProcessMemoryLimit` make the tree kill and the memory cap platform-uniform, while job objects still isolate no filesystem or network — so the sandbox matrix keeps `required` fail-closed on Windows rather than claiming a boundary it does not enforce |
 
 ## 24. Execution budgets and failure containment
 

@@ -668,7 +668,7 @@ Tool processes on every Linux tier (and the rlimit fallback) additionally carry 
 `runtime.tool_memory_limit_mb` is configured — an explicit per-agent address-space cap. Without
 that knob there is no memory cap (the default); per-execution cgroup accounting remains post-v0.1.
 | macOS | `sandbox-exec` (seatbelt) | seatbelt profile: no network, read-only root except workspace | `sandbox-exec` is deprecated by Apple and untested on CI; documented as such |
-| Windows | none in v0.1 | — | `required` ⇒ agent fails to start; `best-effort` ⇒ no OS isolation + limitation logged; job objects + restricted tokens deferred |
+| Windows | `job objects` (one per tool call) | process-tree containment: `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminates every descendant on timeout/cancel/drop, plus `ProcessMemoryLimit` when `runtime.tool_memory_limit_mb` is set | `required` ⇒ agent fails to start (job objects isolate no filesystem or network); `best-effort` ⇒ job objects only + limitation logged; restricted tokens + filesystem isolation deferred |
 
 - `filesystem` and `http` tools enforce their own path/host constraints on ALL platforms
   (defense in depth), independent of the OS backend.
