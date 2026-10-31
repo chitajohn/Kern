@@ -1022,8 +1022,9 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 |----|----------|
 | D25 | `redact()` is wired into both tracing layers; the daemon writes `logs/runtime.jsonl`; redaction integration test; criterion benchmarks on the dev profile (HTML reports off); unbounded surfaces above documented rather than silently accepted |
 | D26 | Engine passes `host[:port]` (default from scheme) so port-scoped network rules are enforceable (port-less rules still match any port); permission decisions are CAS'd on `pending` (conflicting replay → `PERMISSION_REQUEST_ALREADY_DECIDED` 409, same-decision replay idempotent); shell children are tree-killed on drop/timeout — process group on unix, job object on Windows (D29); bracketed IPv6 host rules are exact-host syntax, not globs; API preserves 413 for oversized bodies (`REQUEST_TOO_LARGE`) |
-| D27 | Linux sandbox tier gains `landlock` (kernel LSM write containment, empirically probed ABI mask; no-`bwrap` `required` works on Linux ≥ 5.13); tool subprocess envs are scrubbed to a non-secret allowlist for every backend (credential boundary); approval TTL via schema v2 (`expires_at` + `PERMISSION_REQUEST_EXPIRED`, expired ≡ denied); opt-in event retention (`KERN_EVENT_RETENTION`); gated real-provider tests (`AGENTROUTER_API_KEY`, self-skipping). Deferred items (routing → app layer, no streaming in v0.1, MCP/agent-to-agent/SDK post-v0.1) are recorded in §19 and §25.3 |
+| D27 | Linux sandbox tier gains `landlock` (kernel LSM write containment, empirically probed ABI mask; no-`bwrap` `required` works on Linux ≥ 5.13); tool subprocess envs are scrubbed to a non-secret allowlist for every backend (credential boundary); approval TTL via schema v2 (`expires_at` + `PERMISSION_REQUEST_EXPIRED`, expired ≡ denied); opt-in event retention (`KERN_EVENT_RETENTION`); gated real-provider tests (`AGENTROUTER_API_KEY`, self-skipping). Deferred items (routing → app layer, no streaming in v0.1, agent-to-agent/SDK post-v0.1 — MCP is no longer deferred, see D30) are recorded in §19 and §25.3 |
 | D29 | Windows tool containment is a per-run job object in the transport layer (`kern-tool::process`), not a `kern-core::sandbox` backend: `KILL_ON_JOB_CLOSE` + optional `ProcessMemoryLimit` make the tree kill and the memory cap platform-uniform, while job objects still isolate no filesystem or network — so the sandbox matrix keeps `required` fail-closed on Windows rather than claiming a boundary it does not enforce |
+| D30 | MCP servers are connected at registry build (start/resume), only for servers the agent actually names in `tools`; remote tools are exposed as `<server>.<tool>` under a new `mcp` permission class (default deny); the child is env-scrubbed and tree-contained (D29); a server that cannot start, or does not expose a requested tool, fails the start. Transports are stdio only; server-initiated requests are ignored. |
 
 ## 24. Execution budgets and failure containment
 
@@ -1113,9 +1114,10 @@ for the copied-database threat. Proven by `crates/kern-core/tests/store_perms.rs
 ### 25.3 Deferred from v0.1
 
 Explicitly kept out of v0.1: per-tool
-credential injection, model routing, MCP/SDKs, agent-to-agent tasks, token
+credential injection, model routing, agent-to-agent tasks, token
 accounting, event compaction, and CPU/memory/disk budgets (enforcement
-belongs to the sandbox tier). The event system already carries global
+belongs to the sandbox tier). MCP tool servers graduated out of this list
+(§28); MCP *clients* — Kern acting as a server for other agents — remain out. The event system already carries global
 sequence numbers and per-execution filtering; the transcript endpoint
 reconstructs an execution in order — sufficient for v0.1 without an
 event-sourcing layer.
@@ -1258,3 +1260,45 @@ Two user-visible CLI defects are covered by regression tests:
    into `KERN_HOME`, and the full cycle (run → durable sleep → SIGKILL → restart →
    wake → complete, verified via the API transcript: `checkpoint.restored` in the
    middle of the ordered record) passes end-to-end with `kern --home`.
+
+---
+
+## 28. MCP tool servers
+
+### 28.1 Why the runtime owns the integration
+
+An MCP server is a *tool provider*, not a tool. Handing the model an MCP SDK would let it
+spawn processes and decide capability, which is exactly what the runtime exists to prevent.
+The integration therefore lives in `kern-tool::mcp` as a transport, and the two things Kern
+already guarantees stay in force: the policy gate (§10) and a bounded child process (§22.5).
+
+### 28.2 The shape
+
+- `mcp.servers[]` (config) → `McpServerSpec` → one stdio child per **used** server.
+- Handshake: `initialize` (protocol `2024-11-05`) → `notifications/initialized` →
+  `tools/list`, following `nextCursor` pagination.
+- Remote tools are namespaced `<server>.<tool>` and registered like any builtin, so argument
+  validation, the executor's timeout/concurrency caps, dedup by `tool_call_id`, and event
+  emission are unchanged.
+- `tools/call`: the `content[]` text is flattened into `text`, the raw content and
+  `structuredContent` are preserved, and `isError: true` becomes `TOOL_FAILED` carrying the
+  server's own message.
+- Requests are serialized per server behind one mutex — MCP does not require servers to
+  handle concurrent requests, and one ordered pipe keeps response ids unambiguous.
+
+### 28.3 Trust boundaries
+
+| Concern | Position |
+|---|---|
+| Authorization | `permissions.mcp` globs on `<server>.<tool>`, default deny; `ask` parks the run. A tool named in `tools` without a matching allow/ask rule is rejected at config time. |
+| Secrets | The child never inherits the daemon env: a non-secret allowlist (PATH, HOME, locale, temp, user identity) plus exactly `mcp.servers[].env`. |
+| Process containment | `ContainedChild` — process group on unix, job object (D29) on Windows — so dropping the registry kills an `npx` launcher and its `node` grandchild together. |
+| Availability | Per-request timeout (`mcp.servers[].timeout`, default 30 s) on top of the executor's `tool_timeout`; a dead server fails calls, never the daemon. |
+| Output size | Rendered text capped at 256 KiB; the executor and history trim bound the rest. |
+| Enumeration | The remote `tools/list` decides what *exists*; the runtime decides what is *callable* (config + policy). |
+
+### 28.4 Deliberate gaps
+
+HTTP/SSE transports, `resources`/`prompts`, sampling, elicitation, and server-initiated
+requests are not implemented. Server→client requests are read and ignored rather than
+answered with a capability the runtime does not enforce.

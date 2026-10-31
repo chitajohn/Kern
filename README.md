@@ -21,7 +21,7 @@ checkpoint instead of starting over.
 
 - **Model Abstraction** -- A clean provider trait with raw-HTTP adapters: OpenAI, Anthropic, Ollama, and a deterministic mock for tests and demos.
 
-- **Tool System** -- First-class capabilities with name, description, input schema, permission requirements, and explicit results/errors. Builtins: filesystem, http, memory, sleep. Shell exists but is disabled by default for security.
+- **Tool System** -- First-class capabilities with name, description, input schema, permission requirements, and explicit results/errors. Builtins: filesystem, http, memory, sleep. Shell exists but is disabled by default for security. **MCP servers** (stdio) plug their tools in as `<server>.<tool>` behind the same policy gate.
 
 - **Security by Default** -- The model is never the security boundary. Every tool call passes a policy check (`allow` / `deny` / `ask`). `ask` pauses the agent in `waiting` until a human grants or denies through `kern permissions` + `kern grant`.
 
@@ -174,6 +174,31 @@ export ANTHROPIC_API_KEY=sk-ant-...  # for Anthropic
 | `memory` | Durable agent-scoped KV storage | Allow to configured keys |
 | `sleep` | Pause execution (for testing) | No permission required |
 | `shell` | Execute shell commands | Disabled by default (security) |
+| `<server>.<tool>` | Tools from a configured MCP server | Must be allowed in `permissions.mcp` |
+
+### MCP Servers
+
+Any [MCP](https://modelcontextprotocol.io) server with a stdio transport can provide tools:
+
+```yaml
+mcp:
+  servers:
+    - name: fs
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
+      timeout: 30s
+
+tools: [filesystem, fs.read_file, fs.list_directory]
+
+permissions:
+  mcp:
+    allow: ["fs.read_file", "fs.list_directory"]
+```
+
+Tools are namespaced `<server>.<tool>` and enumerated from the server at agent start. Only
+servers you actually name are launched; they run with a scrubbed environment (the `env:` map
+is the only way to pass a secret), are killed with their whole process tree, and are denied by
+default until `permissions.mcp` allows them.
 
 ### Security Model
 

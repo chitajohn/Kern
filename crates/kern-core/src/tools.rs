@@ -20,6 +20,7 @@ use kern_tool::builtins::{
     filesystem::FileSystemTool, http::HttpTool, memory::MemoryListTool, memory::MemoryReadTool,
     memory::MemoryWriteTool, noop::NoopTool, noop::SleepTool,
 };
+use kern_tool::mcp::{McpServer, McpServerSpec, DEFAULT_MCP_TIMEOUT};
 use kern_tool::{
     CommandRunner, MemoryEntry, MemoryProvider, RunLimits, ToolError, ToolRegistry,
     DEFAULT_OUTPUT_CAP,
@@ -156,9 +157,14 @@ pub const HTTP_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 /// - `noop`/`sleep` are always available fixtures (their permission class is
 ///   "none").
 ///
+/// MCP servers are connected only when the agent names one of their tools
+/// (`<server>.<tool>` in `tools`); a server that cannot start, or does not
+/// expose a requested tool, fails the agent's start rather than exposing a
+/// tool that cannot run.
+///
 /// The registry contains every tool the agent may invoke; the model only
 /// ever sees `spec.tools` (the executor's `specs()` filter).
-pub fn build_registry(
+pub async fn build_registry(
     spec: &AgentSpec,
     store: Arc<Store>,
     workspace: &Path,
@@ -168,6 +174,11 @@ pub fn build_registry(
     let tool_timeout = spec.runtime.tool_timeout().as_std();
 
     for name in &spec.tools {
+        // MCP tools are registered below, once their server has connected and
+        // actually advertised them.
+        if spec.mcp.is_mcp_tool(name) {
+            continue;
+        }
         let tool: Arc<dyn kern_tool::Tool> = match name.as_str() {
             "filesystem" => Arc::new(FileSystemTool::new(
                 permissions.fs_roots(FsAction::Read),
@@ -237,6 +248,63 @@ pub fn build_registry(
             KernError::new(ErrorCode::Internal, format!("register tool {name:?}: {e}"))
         })?;
     }
+
+    // MCP servers: connect only the ones this agent names, so an unused
+    // server can never block an agent's start.
+    for server in &spec.mcp.servers {
+        let prefix = format!("{}.", server.name);
+        let wanted: Vec<String> = spec
+            .tools
+            .iter()
+            .filter(|tool| tool.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let mcp_spec = McpServerSpec {
+            name: server.name.clone(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            env: server.env.clone(),
+            timeout: server
+                .timeout
+                .as_ref()
+                .map(|d| d.as_std())
+                .unwrap_or(DEFAULT_MCP_TIMEOUT),
+        };
+        let connected = McpServer::connect(&mcp_spec).await.map_err(|e| {
+            KernError::new(
+                ErrorCode::ToolUnavailable,
+                format!("mcp server {:?}: {e}", server.name),
+            )
+        })?;
+        let mut exposed: Vec<String> = Vec::new();
+        for tool in connected.into_tools() {
+            let name = tool.name().to_string();
+            if wanted.contains(&name) {
+                registry.register(tool).map_err(|e| {
+                    KernError::new(ErrorCode::Internal, format!("register tool {name:?}: {e}"))
+                })?;
+                exposed.push(name);
+            }
+        }
+        let missing: Vec<String> = wanted
+            .into_iter()
+            .filter(|w| !exposed.contains(w))
+            .collect();
+        if !missing.is_empty() {
+            return Err(KernError::new(
+                ErrorCode::ConfigInvalid,
+                format!(
+                    "mcp server {:?} does not expose {}",
+                    server.name,
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
+
     Ok(Arc::new(registry))
 }
 
@@ -356,6 +424,53 @@ mod tests {
 
         // Empty input still yields the header.
         assert_eq!(memory_digest(&[]), "--- memory ---\n");
+    }
+
+    // ------------------------------------------------------------------
+    // MCP servers (SPEC §9 `mcp.servers`)
+    // ------------------------------------------------------------------
+
+    const MCP_SPEC_TEMPLATE: &str =
+        "version: 1\nname: mcp-agent\nmodel:\n  provider: mock\n  model: m\n\
+        mcp:\n  servers:\n    - name: ghost\n      command: {command}\n\
+        tools: [{tools}]\npermissions:\n  mcp:\n    allow: [\"*\"]\n";
+
+    /// A server that cannot start fails the agent's start: the model must
+    /// never be handed a tool that cannot run (fail closed).
+    #[tokio::test]
+    async fn mcp_server_that_cannot_start_fails_the_start() {
+        let (dir, store) = ctx();
+        let spec = crate::config::parse_agent_spec(
+            &MCP_SPEC_TEMPLATE
+                .replace("{command}", "kern-no-such-mcp-server-xyz")
+                .replace("{tools}", "ghost.thing"),
+        )
+        .expect("config must parse");
+        match build_registry(&spec, store, dir.path()).await {
+            Ok(_) => panic!("a missing server binary must fail the start"),
+            Err(err) => {
+                assert_eq!(err.code(), ErrorCode::ToolUnavailable);
+                assert!(err.to_string().contains("ghost"), "{err}");
+            }
+        }
+    }
+
+    /// An MCP server the agent does not name is never spawned, so a broken
+    /// (or expensive) server cannot block an agent that never uses it.
+    #[tokio::test]
+    async fn unused_mcp_server_is_never_spawned() {
+        let (dir, store) = ctx();
+        let spec = crate::config::parse_agent_spec(
+            &MCP_SPEC_TEMPLATE
+                .replace("{command}", "kern-no-such-mcp-server-xyz")
+                .replace("{tools}", "noop"),
+        )
+        .expect("config must parse");
+        let registry = build_registry(&spec, store, dir.path())
+            .await
+            .expect("the unused server must not be spawned");
+        assert!(registry.has("noop"));
+        assert_eq!(registry.names(), vec!["noop".to_string()]);
     }
 
     // ------------------------------------------------------------------

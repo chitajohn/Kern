@@ -196,8 +196,8 @@ fn config_parser_never_panics_on_hostile_input() {
     }
 }
 
-#[test]
-fn tool_argument_validation_never_panics_on_hostile_json() {
+#[tokio::test]
+async fn tool_argument_validation_never_panics_on_hostile_json() {
     // Build the real per-agent registry the engine would build (all tools).
     let (_dir, store) = test_store();
     let workspace = _dir.path().join("workspace");
@@ -209,6 +209,7 @@ fn tool_argument_validation_never_panics_on_hostile_json() {
     )
     .unwrap();
     let registry = kern_core::tools::build_registry(&spec, Arc::clone(&store), &workspace)
+        .await
         .expect("registry builds");
 
     let mut rng = XorShift64(0xfeed_2026_0801_0002);

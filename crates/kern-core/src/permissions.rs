@@ -170,6 +170,8 @@ pub struct PermissionEngine {
     network: Vec<HostRule>,
     mem_read: Vec<GlobRule>,
     mem_write: Vec<GlobRule>,
+    /// `permissions.mcp` rules, matched against `<server>.<tool>` names.
+    mcp: Vec<GlobRule>,
     shell_allowed: bool,
     /// The agent's workspace root: the base for relative path RULES, and the
     /// fallback base for relative path TARGETS when no rule root exists.
@@ -231,6 +233,7 @@ impl PermissionEngine {
             mem_write: build_glob_rules(
                 permissions.memory.as_ref().and_then(|m| m.write.as_ref()),
             )?,
+            mcp: build_glob_rules(permissions.mcp.as_ref())?,
             shell_allowed: permissions.shell_enabled(),
             workspace: workspace.to_path_buf(),
         })
@@ -301,6 +304,20 @@ impl PermissionEngine {
             }
         }
         finish(best, "memory")
+    }
+
+    /// Evaluate an MCP tool name (`<server>.<tool>`) against
+    /// `permissions.mcp`. Absence of a matching rule defaults to deny, exactly
+    /// like every other class: an MCP server cannot widen its own capability
+    /// by advertising more tools.
+    pub fn evaluate_mcp(&self, tool: &str) -> Decision {
+        let mut best: Option<(usize, Effect, String)> = None;
+        for rule in &self.mcp {
+            if let Some(sp) = rule.specificity(tool) {
+                pick_best(&mut best, sp, rule.effect, &rule.pattern);
+            }
+        }
+        finish(best, "mcp")
     }
 
     /// Whether the `shell` tool is enabled for this agent (the sandbox gate
@@ -888,6 +905,21 @@ mod tests {
         // Write has its own rule set.
         assert!(e.evaluate_key("anything", KeyAction::Write).is_allow());
         assert!(e.evaluate_key("anything", KeyAction::Read).is_allow());
+    }
+
+    #[test]
+    fn mcp_rules_default_deny_and_support_globs() {
+        let e = engine("  mcp:\n    allow: [\"fs.*\"]\n    deny: [\"fs.delete_file\"]\n");
+        assert!(e.evaluate_mcp("fs.read_file").is_allow());
+        // deny wins over the broader allow
+        assert!(e.evaluate_mcp("fs.delete_file").is_deny());
+        // a server the agent never allowed stays denied
+        assert!(e.evaluate_mcp("db.query").is_deny());
+        // no `mcp:` block at all: everything denied
+        assert!(engine("").evaluate_mcp("fs.read_file").is_deny());
+
+        let ask = engine("  mcp:\n    ask: [\"db.*\"]\n");
+        assert!(ask.evaluate_mcp("db.write").is_ask());
     }
 
     #[test]

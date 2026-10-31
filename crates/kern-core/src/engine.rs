@@ -278,7 +278,7 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace)?;
+        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -353,7 +353,7 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace)?;
+        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -402,7 +402,7 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace)?;
+        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -1915,6 +1915,10 @@ impl AgentRunner {
                         "shell".to_string(),
                     )
                 }
+            }
+            _ if self.spec.mcp.is_mcp_tool(tool) => {
+                let d = self.permissions.evaluate_mcp(tool);
+                (decide(&d), tool.to_string(), "mcp".to_string())
             }
             "noop" | "sleep" => (CallDecision::Allow, tool.to_string(), "none".to_string()),
             other => (
