@@ -247,6 +247,13 @@ impl ContainedChild {
         self.child.id()
     }
 
+    /// Windows only: whether the run is inside a job object. `false` means
+    /// assignment failed (logged) and termination degrades to the direct child.
+    #[cfg(windows)]
+    pub fn job_attached(&self) -> bool {
+        self.job.is_some()
+    }
+
     pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
         self.child.stdin.take()
     }
@@ -594,9 +601,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let pid = pid.expect("grandchild must have published its pid before the timeout");
+
+        // `TerminateJobObject` posts termination; the process is not
+        // necessarily gone by the time the call returns (observed on
+        // windows-latest CI). Poll with a bounded deadline, exactly like the
+        // unix process-group tests.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("grandchild {pid} must be terminated with the job object");
+    }
+
+    /// Every captured run must own a job object, otherwise tree termination
+    /// silently degrades to direct-child kill.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn spawned_child_is_assigned_to_a_job() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit 0"]);
+        piped(&mut cmd);
+        let child = ContainedChild::spawn(cmd, None).expect("spawn must succeed");
         assert!(
-            !process_alive(pid),
-            "grandchild {pid} must be terminated with the job object"
+            child.job_attached(),
+            "job assignment failed on this host; the tool tree kill is degraded"
         );
     }
 
