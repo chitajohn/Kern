@@ -416,18 +416,21 @@ impl Lifecycle {
         granted: bool,
         reason: &str,
     ) -> Result<Vec<Event>> {
-        let permission = if granted {
-            EventRecord {
-                kind: EventKind::PermissionGranted.as_str(),
-                execution_id: None,
-                payload: payload::permission_granted(permission_request_id, resource),
-            }
+        let (kind, decision_payload) = if granted {
+            (
+                EventKind::PermissionGranted,
+                payload::permission_granted(permission_request_id, resource),
+            )
         } else {
-            EventRecord {
-                kind: EventKind::PermissionDenied.as_str(),
-                execution_id: None,
-                payload: payload::permission_denied(permission_request_id, resource, reason),
-            }
+            (
+                EventKind::PermissionDenied,
+                payload::permission_denied(permission_request_id, resource, reason),
+            )
+        };
+        let permission = EventRecord {
+            kind: kind.as_str(),
+            execution_id: None,
+            payload: decision_payload.clone(),
         };
         let store = Arc::clone(&self.store);
         let agent_owned = agent_id.to_string();
@@ -469,13 +472,25 @@ impl Lifecycle {
                 )
                 .await
             }
-            other => Err(KernError::new(
-                ErrorCode::InvalidTransition,
-                format!(
-                    "cannot resolve permission request {permission_request_id}: agent {agent_id} is {}",
-                    other.as_str()
-                ),
-            )),
+            other => {
+                // The parked runner can observe the decision and race ahead
+                // (even to completion) before this call runs. Dropping the
+                // event here made the operator's decision invisible — the one
+                // hole in "every decision is a persisted event". This path is
+                // the sole emitter of permission.* events, so persisting the
+                // event without a transition keeps it exactly-once.
+                tracing::debug!(
+                    agent_id,
+                    state = other.as_str(),
+                    "permission decision arrived after the lifecycle moved on; \
+                     recording the event without a transition"
+                );
+                let event = self
+                    .bus
+                    .emit(kind, Some(agent_id), None, decision_payload)
+                    .await?;
+                Ok(vec![event])
+            }
         }
     }
 
