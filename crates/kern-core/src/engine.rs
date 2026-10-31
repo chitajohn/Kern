@@ -1633,6 +1633,10 @@ impl AgentRunner {
                         );
                         let error = json!({ "code": "PERMISSION_DENIED", "message": reason });
                         self.store_tool_terminal(record, None, Some(error)).await?;
+                        // The `permission.denied` event belongs to the decision
+                        // path (`Lifecycle::resolve_wait`), which emits it even
+                        // when the runner wins this race — emitting here too
+                        // would duplicate it.
                         results.push((call.id.clone(), deny_result(&reason)));
                     }
                     PermissionStatus::Expired => {
