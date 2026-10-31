@@ -25,7 +25,7 @@ checkpoint instead of starting over.
 
 - **Security by Default** -- The model is never the security boundary. Every tool call passes a policy check (`allow` / `deny` / `ask`). `ask` pauses the agent in `waiting` until a human grants or denies through `kern permissions` + `kern grant`.
 
-- **Sandboxing** -- Platform-specific isolation, fail-closed. Linux: bubblewrap, landlock, rlimit fallback. macOS: sandbox-exec (seatbelt). Windows: none in v0.1.
+- **Sandboxing** -- Platform-specific isolation, fail-closed. Linux: bubblewrap, landlock, rlimit fallback. macOS: sandbox-exec (seatbelt). Windows: job objects (process-tree containment + memory cap; no filesystem or network isolation, so `required` fails closed).
 
 - **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE.
 
@@ -193,7 +193,7 @@ The model is never the security boundary. Every tool call passes through the per
 | Linux (no `bwrap`) | landlock | Kernel-enforced write containment (Linux >= 5.13) |
 | Linux (no `bwrap`, no landlock) | rlimit fallback | CPU/FSIZE/NOFILE limits only |
 | macOS | sandbox-exec | Seatbelt profile (deprecated by Apple) |
-| Windows | none | In-tool containment only (v0.1) |
+| Windows | job objects | Per-tool-call job object: whole-tree kill on timeout/cancel, memory cap via `runtime.tool_memory_limit_mb`. No filesystem or network isolation (`required` fails closed) |
 
 ---
 
