@@ -497,6 +497,11 @@ pub struct AgentRuntime {
     /// stay in-runner. Default 10s.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_sleep_min: Option<Duration>,
+    /// Stream model output: text fragments are broadcast live as transient
+    /// `model.delta` events (SSE) while the turn itself is recorded normally.
+    /// Default false — v0.1 turn semantics, no provider stream dependency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 impl AgentRuntime {
@@ -558,6 +563,11 @@ impl AgentRuntime {
 
     pub fn log_tool_args(&self) -> bool {
         self.log_tool_args.unwrap_or(false)
+    }
+
+    /// Whether to stream model output (default false).
+    pub fn stream(&self) -> bool {
+        self.stream.unwrap_or(false)
     }
 
     /// Wall-clock cap for one execution (`0`/unset = unbounded).

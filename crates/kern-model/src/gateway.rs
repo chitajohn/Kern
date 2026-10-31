@@ -155,6 +155,37 @@ impl ModelGateway {
     }
 }
 
+impl ModelGateway {
+    /// Streaming variant of [`ModelGateway::complete`]: one attempt, bounded by
+    /// the same `model.timeout`, with each text fragment pushed to `deltas` as
+    /// it arrives.
+    ///
+    /// **No retries.** A retry would replay text the client already saw, and a
+    /// mid-stream failure has produced no durable effect: the turn is recorded
+    /// only by the final response (ARCHITECTURE §29). The caller can retry the
+    /// whole step if it still wants to.
+    pub async fn complete_streaming(
+        &self,
+        req: &CompletionRequest,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<CompletionResponse, ModelError> {
+        let provider = self.providers.get(&req.provider).ok_or_else(|| {
+            ModelError::Unavailable(format!(
+                "no provider adapter registered for '{}'",
+                req.provider
+            ))
+        })?;
+
+        let timeout = req.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        let deadline = Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, provider.stream(req, deltas)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(finalize(err, 0)),
+            Err(_elapsed) => Err(ModelError::Timeout(timeout)),
+        }
+    }
+}
+
 /// Map the final attempt's error onto the public surface: permanent errors
 /// pass through unchanged; an exhausted transient budget becomes
 /// `BudgetExhausted` (or `Timeout` when the final failure was a timeout).
@@ -326,6 +357,55 @@ mod tests {
             "duplicate id must be rejected, got {err:?}"
         );
         assert_eq!(gateway.provider_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_forwards_deltas_and_returns_the_turn() {
+        let provider = MockProvider::finishing("abcdefghijklmnop");
+        let mut gateway = ModelGateway::new();
+        gateway.register(Arc::new(provider)).unwrap();
+
+        let (delta_tx, mut delta_rx) = crate::provider::delta_channel();
+        let mut r = req("mock");
+        r.retries = Some(3);
+        let response = gateway.complete_streaming(&r, &delta_tx).await.unwrap();
+        drop(delta_tx);
+
+        let mut streamed = String::new();
+        let mut fragments = 0;
+        while let Some(text) = delta_rx.recv().await {
+            fragments += 1;
+            streamed.push_str(&text);
+        }
+        match response {
+            CompletionResponse::Finish { text, .. } => assert_eq!(text, "abcdefghijklmnop"),
+            other => panic!("expected finish, got {other:?}"),
+        }
+        assert_eq!(streamed, "abcdefghijklmnop");
+        assert!(fragments > 1, "the mock streams in chunks: {fragments}");
+    }
+
+    /// Streaming is single-attempt: a retry could duplicate text the client
+    /// already received, so the budget is spent on the first failure.
+    #[tokio::test]
+    async fn streaming_never_retries() {
+        let provider = MockProvider::new([
+            ScriptedStep::Fail(ModelError::Unavailable("boom".into())),
+            ScriptedStep::Finish("never served".into()),
+        ]);
+        let mut gateway = ModelGateway::new();
+        gateway.register(Arc::new(provider.clone())).unwrap();
+
+        let (delta_tx, _delta_rx) = crate::provider::delta_channel();
+        let mut r = req("mock");
+        r.retries = Some(3);
+        let err = gateway.complete_streaming(&r, &delta_tx).await.unwrap_err();
+        assert!(matches!(err, ModelError::BudgetExhausted(_)), "{err:?}");
+        assert_eq!(
+            provider.remaining(),
+            1,
+            "the second scripted step must not be consumed"
+        );
     }
 
     #[test]

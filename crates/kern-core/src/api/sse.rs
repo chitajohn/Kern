@@ -65,8 +65,13 @@ pub async fn stream_events(
             tokio::select! {
                 _ = shutdown.changed() => break,
                 recv = sub.recv() => match recv {
-                    Ok(event) if event.seq > last => {
-                        last = event.seq;
+                    // `seq == 0` marks a transient event (e.g. a streaming
+                    // `model.delta`): it is never replayed, so it is always
+                    // forwarded and never advances the durable cursor.
+                    Ok(event) if event.seq == 0 || event.seq > last => {
+                        if event.seq > 0 {
+                            last = event.seq;
+                        }
                         if tx.send(event).await.is_err() {
                             break; // client disconnected
                         }

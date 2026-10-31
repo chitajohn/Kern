@@ -330,6 +330,7 @@ Envelope: `{ "seq": 12, "ts": "…", "kind": "tool.completed", "agent_id": "…"
 | `model.requested` | `{ "provider", "model", "step" }` |
 | `model.completed` | `{ "provider", "model", "kind": "finish" | "tool_call", "latency_ms" }` |
 | `model.failed` | `{ "error": {…} }` |
+| `model.delta` | `{ "provider", "model", "step", "text" }` — **broadcast-only**: emitted only with `runtime.stream: true`, carries `seq = 0`, is never persisted, and is never returned by replay/transcript. Deltas are advisory: the turn is recorded from the final `model.completed` response, so a stream that dies mid-flight leaves no durable record. |
 | `tool.requested` | `{ "tool_call_id", "tool_name", "args": {…} }` (args only when `log_tool_args` enabled) |
 | `tool.started` | `{ "tool_call_id", "tool_name" }` |
 | `tool.completed` | `{ "tool_call_id", "tool_name", "latency_ms", "result_size" }` |
@@ -545,6 +546,8 @@ runtime:
   durable_sleep_min: 10s       # optional, default 10s; `sleep` calls at or above this
                                # park the agent (durable, runner unloaded); shorter sleeps
                                # run inside the runner
+  stream: false                # optional, default false; broadcast live model text
+                               # as transient `model.delta` events (never persisted, §6)
 ```
 
 **Rules**

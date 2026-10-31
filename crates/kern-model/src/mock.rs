@@ -133,6 +133,24 @@ impl ModelProvider for MockProvider {
             }
         }
     }
+
+    /// Streaming: the scripted text is delivered in small deterministic
+    /// chunks, so engine tests can assert live deltas without a network call.
+    async fn stream(
+        &self,
+        req: &CompletionRequest,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<CompletionResponse, ModelError> {
+        let response = self.complete(req).await?;
+        if let CompletionResponse::Finish { text, .. } = &response {
+            let chars: Vec<char> = text.chars().collect();
+            for chunk in chars.chunks(8) {
+                crate::provider::emit_delta(deltas, &chunk.iter().collect::<String>());
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(response)
+    }
 }
 
 #[cfg(test)]

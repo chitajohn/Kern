@@ -868,8 +868,9 @@ call.
 - Distributed execution, remote workers, agent migration (v0.3 roadmap).
 - Multi-user / multi-tenant / cloud control plane.
 - Sub-agents / agents-as-tools (v0.2; the `Tool` trait is the hook).
-- Token-level model streaming and mid-run user input (v0.2; `agent.thinking` covers reasoning
-  visibility in v0.1).
+- Mid-run user input (v0.2; `agent.thinking` covers reasoning visibility). Token streaming
+  ships as live-only deltas (§29), but *durable* streaming — checkpointed cursors that let an
+  interrupted generation resume — remains deferred (§24.5).
 - Memory providers beyond the durable KV store (provider trait exists; file/vector backends
   land in v0.2).
 - A web UI (desktop/web clients are future application layers on the same API).
@@ -1025,6 +1026,7 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 | D27 | Linux sandbox tier gains `landlock` (kernel LSM write containment, empirically probed ABI mask; no-`bwrap` `required` works on Linux ≥ 5.13); tool subprocess envs are scrubbed to a non-secret allowlist for every backend (credential boundary); approval TTL via schema v2 (`expires_at` + `PERMISSION_REQUEST_EXPIRED`, expired ≡ denied); opt-in event retention (`KERN_EVENT_RETENTION`); gated real-provider tests (`AGENTROUTER_API_KEY`, self-skipping). Deferred items (routing → app layer, no streaming in v0.1, agent-to-agent/SDK post-v0.1 — MCP is no longer deferred, see D30) are recorded in §19 and §25.3 |
 | D29 | Windows tool containment is a per-run job object in the transport layer (`kern-tool::process`), not a `kern-core::sandbox` backend: `KILL_ON_JOB_CLOSE` + optional `ProcessMemoryLimit` make the tree kill and the memory cap platform-uniform, while job objects still isolate no filesystem or network — so the sandbox matrix keeps `required` fail-closed on Windows rather than claiming a boundary it does not enforce |
 | D30 | MCP servers are connected at registry build (start/resume), only for servers the agent actually names in `tools`; remote tools are exposed as `<server>.<tool>` under a new `mcp` permission class (default deny); the child is env-scrubbed and tree-contained (D29); a server that cannot start, or does not expose a requested tool, fails the start. Transports are stdio only; server-initiated requests are ignored. |
+| D31 | Token streaming is observational only: `runtime.stream` (default off) makes `ModelGateway::complete_streaming` push deltas through a channel to transient `model.delta` events (`seq = 0`, never persisted, never replayed); the turn is still recorded from the final response; a streaming attempt is never retried, because a replay would duplicate text the client already saw. OpenAI-compatible adapters stream SSE (including fragmented tool calls); other adapters fall back to one whole-text delta. |
 
 ## 24. Execution budgets and failure containment
 
@@ -1066,13 +1068,21 @@ A consecutive-failure streak (default threshold 3,
 (30s..30min), emitting a catalog `scheduler.backoff` event. Disable per agent
 with a large threshold or `backoff: none`.
 
-### 24.5 Streaming stays out
+### 24.5 Streaming is observational, not durable (D31)
 
-Token-level streaming cannot coexist safely with the step-based checkpoint
-boundary: a checkpoint taken mid-stream is not a valid resume point, and
-token-by-token persistence multiplies storage and event volume. Streaming
-belongs in a future abstraction where the *stream itself* is the durable unit
-(checkpointed cursors), not the v0.1 turn-based one.
+The original v0.1 position was "no streaming at all": token-by-token
+persistence multiplies storage and event volume, and a checkpoint taken
+mid-stream is not a valid resume point. The resolution is a split:
+
+- **Deltas** (`runtime.stream: true`) are broadcast live as transient
+  `model.delta` events with `seq = 0` — never persisted, never replayed, never
+  part of a checkpoint (§29).
+- **The turn** is still recorded from the final response, so recovery and
+  `executions`/`tool_calls` see exactly what a non-streaming run would.
+
+What remains deferred is the *durable stream* — checkpointed cursors where the
+stream itself is the resume unit, so a long generation can be interrupted and
+continued instead of discarded.
 
 ---
 
@@ -1302,3 +1312,55 @@ already guarantees stay in force: the policy gate (§10) and a bounded child pro
 HTTP/SSE transports, `resources`/`prompts`, sampling, elicitation, and server-initiated
 requests are not implemented. Server→client requests are read and ignored rather than
 answered with a capability the runtime does not enforce.
+
+---
+
+## 29. Token streaming
+
+### 29.1 The split that makes it safe
+
+§24.5 says a mid-stream checkpoint is not a resume point. Streaming therefore never
+becomes durable state. Two paths are kept strictly apart:
+
+| | Durability | Consumer |
+|---|---|---|
+| **Deltas** (`model.delta`) | none (`seq = 0`, not in SQLite) | live SSE subscribers, `kern logs -f` |
+| **The turn** (`model.completed` + session) | full, unchanged | replay, recovery, transcripts |
+
+The engine records the turn from the final `CompletionResponse`, exactly as a
+non-streaming run would. A stream that dies mid-flight therefore leaves the execution
+exactly where it was — no partial assistant message, no half-recorded tool call.
+
+### 29.2 The path
+
+```
+ModelGateway::complete_streaming(req, &DeltaSender)   // one attempt, model.timeout
+  └── ModelProvider::stream(req, &DeltaSender)        // trait method, default = whole text
+        ├── OpenAI adapter: SSE frames, tool-call fragments accumulated by index
+        ├── mock: deterministic 8-char chunks (engine tests)
+        └── Anthropic / Ollama: default fallback (one delta at completion)
+  └── engine: forward task drains the channel → EventBus::emit_transient(ModelDelta)
+        └── broadcast → GET /events/stream (seq 0 always forwarded, cursor unchanged)
+```
+
+### 29.3 Rules
+
+- **Opt-in per agent** (`runtime.stream`, default off): streaming changes provider
+  behaviour (some OpenAI-compatible gateways behave differently with `stream: true`), so
+  turn semantics stay the default.
+- **Single attempt.** Streaming is not retried: replaying a turn would duplicate text the
+  client already saw. A failed stream fails the step, and the caller decides whether to
+  retry the whole step.
+- **Bounded.** The gateway's `model.timeout` covers the whole stream, and the adapters cap
+  the byte volume (10 MiB) as they do for normal responses.
+- **Ordered.** Deltas are pushed through one channel per turn and forwarded by one task, so
+  fragment order always matches the provider's.
+- **Invisible to replay.** `emit_transient` writes nothing; `GET /events/stream` forwards
+  `seq == 0` events without advancing its durable cursor, so a reconnecting client never
+  mistakes a delta for a position in the log.
+
+### 29.4 Gaps
+
+Anthropic and Ollama fall back to a single whole-text delta (their native event streams are
+not parsed yet). There is no client-side resume of a partially received stream — that
+requires the durable-stream abstraction §24.5 still defers.

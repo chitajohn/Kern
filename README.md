@@ -27,7 +27,7 @@ checkpoint instead of starting over.
 
 - **Sandboxing** -- Platform-specific isolation, fail-closed. Linux: bubblewrap, landlock, rlimit fallback. macOS: sandbox-exec (seatbelt). Windows: job objects (process-tree containment + memory cap; no filesystem or network isolation, so `required` fails closed).
 
-- **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE.
+- **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE. With `runtime.stream: true`, model text also streams live as transient `model.delta` events (never persisted — the turn is still recorded from the final response).
 
 - **Scheduling** -- Agents can run on an interval or cron schedule with crash-safe scheduling state.
 
@@ -97,6 +97,7 @@ runtime:
   checkpoint_interval: 60s
   max_steps: 100
   checkpoint_retention: 50
+  stream: true             # optional: broadcast live model text (`model.delta` over SSE)
   schedule:                # optional: run on an interval or cron
     every: 1h
 ```

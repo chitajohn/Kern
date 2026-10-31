@@ -1265,7 +1265,33 @@ impl AgentRunner {
             )
             .await?;
         let started = Instant::now();
-        let result = self.gateway.complete(&request).await;
+        let result = if self.spec.runtime.stream() {
+            // Live deltas are broadcast-only (`model.delta`, seq 0): the turn
+            // is recorded from the final response exactly as before, so a
+            // stream that dies mid-flight has produced no durable effect.
+            let (deltas, mut rx) = kern_model::delta_channel();
+            let bus = self.bus.clone();
+            let agent_id = self.agent.id.clone();
+            let execution_id = self.execution_id.clone();
+            let provider = self.spec.model.provider.as_str().to_string();
+            let model = self.spec.model.model.clone();
+            let forward = tokio::spawn(async move {
+                while let Some(text) = rx.recv().await {
+                    bus.emit_transient(
+                        EventKind::ModelDelta,
+                        Some(&agent_id),
+                        Some(&execution_id),
+                        payload::model_delta(&provider, &model, step, &text),
+                    );
+                }
+            });
+            let result = self.gateway.complete_streaming(&request, &deltas).await;
+            drop(deltas);
+            let _ = forward.await;
+            result
+        } else {
+            self.gateway.complete(&request).await
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
 
         match result {

@@ -73,6 +73,11 @@ pub enum EventKind {
     ModelCompleted,
     #[serde(rename = "model.failed")]
     ModelFailed,
+    /// Live text fragment from a streaming model turn. **Broadcast-only:**
+    /// this kind is never persisted (`seq == 0`), because token-by-token rows
+    /// would multiply storage for no recovery value (§29).
+    #[serde(rename = "model.delta")]
+    ModelDelta,
     #[serde(rename = "tool.requested")]
     ToolRequested,
     #[serde(rename = "tool.started")]
@@ -103,7 +108,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// All catalog kinds in catalog order (`SPEC.md §6`).
-    pub const ALL: [EventKind; 32] = [
+    pub const ALL: [EventKind; 33] = [
         EventKind::RuntimeStarted,
         EventKind::RuntimeShuttingDown,
         EventKind::AgentCreated,
@@ -123,6 +128,7 @@ impl EventKind {
         EventKind::ModelRequested,
         EventKind::ModelCompleted,
         EventKind::ModelFailed,
+        EventKind::ModelDelta,
         EventKind::ToolRequested,
         EventKind::ToolStarted,
         EventKind::ToolCompleted,
@@ -160,6 +166,7 @@ impl EventKind {
             EventKind::ModelRequested => "model.requested",
             EventKind::ModelCompleted => "model.completed",
             EventKind::ModelFailed => "model.failed",
+            EventKind::ModelDelta => "model.delta",
             EventKind::ToolRequested => "tool.requested",
             EventKind::ToolStarted => "tool.started",
             EventKind::ToolCompleted => "tool.completed",
@@ -201,6 +208,7 @@ impl FromStr for EventKind {
             "model.requested" => Ok(EventKind::ModelRequested),
             "model.completed" => Ok(EventKind::ModelCompleted),
             "model.failed" => Ok(EventKind::ModelFailed),
+            "model.delta" => Ok(EventKind::ModelDelta),
             "tool.requested" => Ok(EventKind::ToolRequested),
             "tool.started" => Ok(EventKind::ToolStarted),
             "tool.completed" => Ok(EventKind::ToolCompleted),
@@ -364,6 +372,30 @@ impl EventBus {
             .map_err(|e| KernError::internal(format!("event replay task failed: {e}")))?
     }
 
+    /// Broadcast an event **without persisting it** (`seq == 0`).
+    ///
+    /// Transient events carry live-only information — today, streaming model
+    /// deltas (§29). They are deliberately outside the durable record: replay
+    /// and recovery never see them, and `GET /events/stream` forwards them to
+    /// connected clients only. A broadcast with no subscribers is a no-op.
+    pub fn emit_transient(
+        &self,
+        kind: EventKind,
+        agent_id: Option<&str>,
+        execution_id: Option<&str>,
+        payload: Value,
+    ) {
+        let event = Event {
+            seq: 0,
+            ts: chrono::Utc::now(),
+            kind: kind.as_str().to_string(),
+            agent_id: agent_id.map(str::to_string),
+            execution_id: execution_id.map(str::to_string),
+            payload,
+        };
+        let _ = self.sender.send(event);
+    }
+
     /// Broadcast already-persisted events (e.g. appended atomically with a
     /// lifecycle transition by `Store::transition`) to live subscribers.
     /// No persistence happens here; SQLite is already the source of truth.
@@ -462,6 +494,7 @@ mod tests {
             &["provider", "model", "kind", "latency_ms"],
         ),
         ("model.failed", &["error"]),
+        ("model.delta", &["provider", "model", "step", "text"]),
         ("tool.requested", &["tool_call_id", "tool_name", "args"]),
         ("tool.started", &["tool_call_id", "tool_name"]),
         (
@@ -696,6 +729,11 @@ mod tests {
                 payload::scheduler_backoff("a", 3, "2026-08-15T00:00:00Z"),
                 &["agent_id", "consecutive_failures", "next_run_at"],
             ),
+            (
+                EventKind::ModelDelta,
+                payload::model_delta("mock", "test", 1, "hi"),
+                &["provider", "model", "step", "text"],
+            ),
         ];
 
         assert_eq!(
@@ -780,6 +818,27 @@ mod tests {
         let replayed = bus.replay(0, 100).await.unwrap();
         assert_eq!(replayed.len(), 5);
         assert!(replayed.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
+    /// Transient events reach live subscribers but leave no trace: no row, no
+    /// seq, nothing for replay or recovery to trip over.
+    #[tokio::test]
+    async fn transient_events_broadcast_without_persisting() {
+        let (_dir, store, bus) = test_bus().await;
+        let mut sub = bus.subscribe();
+        bus.emit_transient(
+            EventKind::ModelDelta,
+            Some("agent-1"),
+            Some("exec-1"),
+            payload::model_delta("mock", "test", 1, "hi"),
+        );
+        let event = sub.recv().await.unwrap();
+        assert_eq!(event.kind, "model.delta");
+        assert_eq!(event.seq, 0, "transient events carry no durable seq");
+        assert_eq!(event.payload["text"], json!("hi"));
+        assert_eq!(store.event_count_for_agent("agent-1").unwrap(), 0);
+        assert_eq!(bus.latest_seq().await.unwrap(), 0);
+        assert!(bus.replay(0, 100).await.unwrap().is_empty());
     }
 
     #[tokio::test]
