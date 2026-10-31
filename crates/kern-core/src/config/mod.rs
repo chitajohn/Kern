@@ -179,6 +179,10 @@ pub struct AgentSpec {
     pub description: Option<String>,
     pub model: ModelConfig,
     pub tools: Vec<String>,
+    /// External MCP tool servers (stdio transport). Their tools are named
+    /// `<server>.<tool>` and must also be listed in `tools`.
+    #[serde(default, skip_serializing_if = "McpConfig::is_empty")]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
@@ -227,6 +231,9 @@ pub struct MemoryConfig {
 pub struct PermissionsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filesystem: Option<FilesystemRules>,
+    /// MCP tool rules: `<server>.<tool>` globs, default deny.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<RuleList>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkRules>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,6 +330,96 @@ impl SandboxMode {
             SandboxMode::BestEffort => "best-effort",
             SandboxMode::Off => "off",
         }
+    }
+}
+
+/// `mcp:` block — external MCP tool servers over stdio (SPEC.md §9).
+///
+/// Servers are spawned as child processes with a scrubbed environment; every
+/// tool they expose is a normal permission-gated Kern tool named
+/// `<server>.<tool>`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Server name; its tools are `<name>.<tool>`.
+    pub name: String,
+    /// Executable on `PATH` (or an absolute path).
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The only environment the server sees beyond a non-secret allowlist.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Per-request JSON-RPC deadline (default 30s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Duration>,
+}
+
+impl McpConfig {
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// The configured server that owns `tool` (`<server>.<tool>`), if any.
+    pub fn owner_of(&self, tool: &str) -> Option<&McpServerConfig> {
+        let (server, _) = tool.split_once('.')?;
+        self.servers.iter().find(|s| s.name == server)
+    }
+
+    /// Whether `tool` names a tool of a configured server.
+    pub fn is_mcp_tool(&self, tool: &str) -> bool {
+        self.owner_of(tool).is_some()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut seen: Vec<&str> = Vec::new();
+        for server in &self.servers {
+            if !valid_slug(&server.name) {
+                return Err(invalid(
+                    "mcp.servers.name",
+                    format!(
+                        "invalid server name {:?}: must match [a-z0-9][a-z0-9-_]*",
+                        server.name
+                    ),
+                ));
+            }
+            if seen.contains(&server.name.as_str()) {
+                return Err(invalid(
+                    "mcp.servers.name",
+                    format!("duplicate MCP server {:?}", server.name),
+                ));
+            }
+            seen.push(&server.name);
+            if server.command.trim().is_empty() {
+                return Err(invalid(
+                    "mcp.servers.command",
+                    format!("server {:?}: command must not be empty", server.name),
+                ));
+            }
+            if let Some(timeout) = server.timeout {
+                if timeout.as_millis() == 0 {
+                    return Err(invalid(
+                        "mcp.servers.timeout",
+                        format!("server {:?}: timeout must be positive", server.name),
+                    ));
+                }
+            }
+            for key in server.env.keys() {
+                if key.trim().is_empty() {
+                    return Err(invalid(
+                        "mcp.servers.env",
+                        format!("server {:?}: env keys must not be empty", server.name),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -551,27 +648,42 @@ impl AgentSpec {
             }
         }
 
-        // Tools: known names, and tool class gates from §9.
+        // Tools: known builtin names, or `<server>.<tool>` for a configured
+        // MCP server; tool class gates from §9.
         for tool in &self.tools {
-            if !KNOWN_TOOLS.contains(&tool.as_str()) {
+            if KNOWN_TOOLS.contains(&tool.as_str()) {
+                if tool.starts_with("memory.") && !self.memory.enabled {
+                    return Err(invalid(
+                        "tools",
+                        format!("tool {tool:?} requires memory.enabled: true"),
+                    ));
+                }
+                if tool == "shell" && !self.permissions.shell_enabled() {
+                    return Err(invalid(
+                        "tools",
+                        "the shell tool must not be exposed unless permissions.shell.enabled: true",
+                    ));
+                }
+                continue;
+            }
+            if !self.mcp.is_mcp_tool(tool) {
                 return Err(invalid(
                     "tools",
-                    format!("unknown tool {tool:?} (known: {})", KNOWN_TOOLS.join(", ")),
+                    format!(
+                        "unknown tool {tool:?} (known: {}; MCP tools are \
+                         \"<server>.<tool>\" for a server in `mcp.servers`)",
+                        KNOWN_TOOLS.join(", ")
+                    ),
                 ));
             }
-            if tool.starts_with("memory.") && !self.memory.enabled {
+            if !self.permissions.mcp_permits(tool) {
                 return Err(invalid(
                     "tools",
-                    format!("tool {tool:?} requires memory.enabled: true"),
-                ));
-            }
-            if tool == "shell" && !self.permissions.shell_enabled() {
-                return Err(invalid(
-                    "tools",
-                    "the shell tool must not be exposed unless permissions.shell.enabled: true",
+                    format!("MCP tool {tool:?} must be allowed or asked in permissions.mcp"),
                 ));
             }
         }
+        self.mcp.validate()?;
 
         self.memory.validate()?;
         self.permissions.validate()?;
@@ -602,6 +714,25 @@ impl PermissionsConfig {
     /// The shell tool is exposed only when `permissions.shell.enabled` is true.
     pub fn shell_enabled(&self) -> bool {
         self.shell.as_ref().map(|s| s.enabled).unwrap_or(false)
+    }
+
+    /// Whether an MCP tool name is allowed or asks under `permissions.mcp`.
+    /// `deny` (and the absence of a matching rule) default-denies.
+    pub fn mcp_permits(&self, tool: &str) -> bool {
+        let Some(rules) = &self.mcp else {
+            return false;
+        };
+        let matches = |patterns: &Option<Vec<String>>| {
+            patterns.iter().flatten().any(|pattern| {
+                glob::Pattern::new(pattern)
+                    .map(|p| p.matches(tool))
+                    .unwrap_or(false)
+            })
+        };
+        if matches(&rules.deny) {
+            return false;
+        }
+        matches(&rules.allow) || matches(&rules.ask)
     }
 
     fn validate(&self) -> Result<()> {
@@ -658,6 +789,22 @@ impl PermissionsConfig {
                     "permissions.shell.sandbox",
                     "required when permissions.shell.enabled is true (required | best-effort | off)",
                 ));
+            }
+        }
+        if let Some(mcp) = &self.mcp {
+            for pattern in mcp.entries() {
+                if pattern.trim().is_empty() {
+                    return Err(invalid(
+                        "permissions.mcp",
+                        "tool patterns must not be empty",
+                    ));
+                }
+                if glob::Pattern::new(pattern).is_err() {
+                    return Err(invalid(
+                        "permissions.mcp",
+                        format!("invalid tool pattern {pattern:?}"),
+                    ));
+                }
             }
         }
         Ok(())
@@ -1039,6 +1186,98 @@ tools:
         let err = parse_agent_spec(&yaml).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigInvalid);
         assert!(err.message.contains("shell"), "{}", err.message);
+    }
+
+    // ------------------------------------------------------------------
+    // MCP servers and tools
+    // ------------------------------------------------------------------
+
+    fn mcp_yaml(tools: &str, permissions: &str, extra_servers: &str) -> String {
+        format!(
+            "version: 1\nname: mcp-agent\nmodel:\n  provider: mock\n  model: test\n\
+             mcp:\n  servers:\n    - name: fs\n      command: npx\n      args: [\"-y\", \"srv\"]\n\
+             {extra_servers}tools: [{tools}]\npermissions:\n{permissions}\n"
+        )
+    }
+
+    #[test]
+    fn mcp_block_parses_and_names_tools() {
+        let spec = parse_agent_spec(&mcp_yaml(
+            "fs.read_file",
+            "  mcp:\n    allow: [\"fs.*\"]\n    ask: [\"fs.write_file\"]\n",
+            "",
+        ))
+        .expect("valid MCP config must parse");
+
+        assert_eq!(spec.mcp.servers.len(), 1);
+        let server = &spec.mcp.servers[0];
+        assert_eq!(server.name, "fs");
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.args, vec!["-y".to_string(), "srv".to_string()]);
+        assert!(server.timeout.is_none(), "timeout defaults when absent");
+        assert!(spec.mcp.is_mcp_tool("fs.read_file"));
+        assert!(!spec.mcp.is_mcp_tool("memory.read"), "builtins are not MCP");
+        assert!(spec.permissions.mcp_permits("fs.write_file"), "ask permits");
+
+        // Round-trips through serde (the store keeps configs as JSON).
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: AgentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn mcp_tool_requires_a_permission_rule() {
+        let err = parse_agent_spec(&mcp_yaml(
+            "fs.read_file",
+            "  mcp:\n    deny: [\"fs.*\"]\n",
+            "",
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigInvalid);
+        assert!(err.message.contains("permissions.mcp"), "{}", err.message);
+    }
+
+    #[test]
+    fn mcp_tool_requires_a_configured_server() {
+        let err = parse_agent_spec(&mcp_yaml(
+            "ghost.read_file",
+            "  mcp:\n    allow: [\"*\"]\n",
+            "",
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigInvalid);
+        assert!(err.message.contains("unknown tool"), "{}", err.message);
+    }
+
+    #[test]
+    fn duplicate_mcp_servers_are_rejected() {
+        let duplicate = "    - name: fs\n      command: other\n";
+        let err = parse_agent_spec(&mcp_yaml(
+            "fs.read_file",
+            "  mcp:\n    allow: [\"fs.*\"]\n",
+            duplicate,
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigInvalid);
+        assert!(err.message.contains("duplicate"), "{}", err.message);
+    }
+
+    #[test]
+    fn invalid_mcp_glob_is_rejected() {
+        // The first pattern covers the tool; the second is a malformed glob
+        // that must still fail validation rather than silently never match.
+        let err = parse_agent_spec(&mcp_yaml(
+            "fs.read_file",
+            "  mcp:\n    allow: [\"fs.*\", \"fs.[\"]\n",
+            "",
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigInvalid);
+        assert!(
+            err.message.contains("invalid tool pattern"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

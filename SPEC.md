@@ -474,9 +474,18 @@ model:
   base_url: null               # optional: override provider base URL
 
 tools:                         # required, non-empty
-  - filesystem                 # each: name of a builtin or custom registered tool
-  - http
+  - filesystem                 # each: name of a builtin or custom registered tool,
+  - http                       # or "<server>.<tool>" for an MCP server below
   # shell is NOT available here unless explicitly enabled in permissions
+
+mcp:                           # optional; external MCP tool servers (stdio)
+  servers:
+    - name: fs                 # required slug; its tools are "fs.<tool>"
+      command: npx             # required; executable on PATH (or absolute)
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
+      env:                     # optional; the ONLY env the server sees
+        FS_TOKEN: placeholder  #   beyond a non-secret allowlist (§12)
+      timeout: 30s             # optional per-request deadline (default 30s)
 
 memory:
   enabled: false               # optional; exposes memory.read/write/list tools
@@ -557,7 +566,7 @@ runtime:
 
 Evaluation for a request `(resource_class, resource, action)`:
 
-1. Select rules for `resource_class` (`filesystem`, `network`, `memory`, `shell`).
+1. Select rules for `resource_class` (`filesystem`, `network`, `memory`, `shell`, `mcp`).
 2. Match most-specific rule (longest canonical path prefix / exact host).
 3. Precedence within a match: `deny` > `ask` > `allow`.
 4. No match ⇒ `deny` (default deny).
@@ -569,7 +578,11 @@ Evaluation for a request `(resource_class, resource, action)`:
    port — the runtime evaluates the URL's host with its port (default port filled from the
    scheme), so port-scoped rules are enforceable. No match ⇒ deny.
 7. `memory`: glob-match keys against read/write rules; no match ⇒ deny.
-8. Result is one of `Allow { reason } | Deny { reason } | Ask`.
+8. `mcp`: glob-match the fully-qualified tool name (`<server>.<tool>`) against
+   `permissions.mcp` allow/ask/deny; no match ⇒ deny. The tool list is decided by the
+   runtime at agent start, so a server advertising extra tools gains nothing: only tools a
+   matching rule permits are ever callable.
+9. Result is one of `Allow { reason } | Deny { reason } | Ask`.
 
 A `Deny` result is returned to the model as a tool error with code `PERMISSION_DENIED` and the
 reason text. The runtime MUST NOT execute the tool.
@@ -641,6 +654,7 @@ pub trait Tool: Send + Sync {
 | `memory.read` / `memory.write` / `memory.list` | `{ key }` / `{ key, value, description? }` / `{ prefix? }` | `memory:read\|write` | durable agent-scoped KV; glob policy; size caps |
 | `shell` | `{ command: string, cwd? }` | `shell` | only when enabled; sandboxed; output cap |
 | `noop` / `sleep` | `{}` / `{ ms: int }` | none | test & recovery-suite fixtures |
+| `<server>.<tool>` | server-defined (`tools/list`) | `mcp:<server>.<tool>` | MCP stdio servers (`mcp.servers`); enumerated at agent start; env-scrubbed child process |
 
 **Behavioral details (normative):**
 
@@ -653,6 +667,31 @@ pub trait Tool: Send + Sync {
   than the response cap fail with `TOOL_FAILED` (never silently truncated). An empty host
   allowlist denies all requests.
 - `sleep`: capped at 60 s (fixture for timeout/concurrency tests).
+
+### 11.4 MCP tool servers (normative)
+
+`mcp.servers[]` adds external [MCP](https://modelcontextprotocol.io) servers (stdio transport,
+newline-delimited JSON-RPC 2.0) as tool providers.
+
+- **Lifecycle.** A server is spawned at agent start **only when the agent names one of its
+tools** in `tools` (the same rule applies to the registry rebuild on resume/recovery); a
+configured-but-unused server is never started. The runtime performs `initialize` →
+`notifications/initialized` → `tools/list` (following `nextCursor` pagination).
+- **Fail closed.** A server that cannot spawn, does not complete the handshake in its
+`timeout`, or does not expose a tool named in `tools` fails the agent's start
+(`TOOL_UNAVAILABLE` for an unusable server, `CONFIG_INVALID` for a missing tool). The model is
+never handed a tool that cannot run.
+- **Naming.** Remote tools are exposed as `<server>.<tool>`. `tools/call` arguments are
+validated against the server's `inputSchema` by the same registry validator as builtins.
+- **Authorization.** Every call is classified under the `mcp` class (§10) before execution;
+`permissions.mcp` is required (a tool listed in `tools` without an allow/ask matching rule is
+rejected at config time). `ask` parks the run for human approval like any other class.
+- **Isolation.** The server is a child of the runtime with a scrubbed environment (non-secret
+allowlist only; the `env:` map is the sole way to hand it a secret), a per-request timeout
+(`mcp.servers[].timeout`, default 30 s), and whole-tree termination when the tool registry is
+dropped. Rendered result text is capped at 256 KiB.
+- **Not included.** HTTP/SSE transports, `resources`/`prompts`, sampling/elicitation, and
+server-initiated requests (they are read and ignored, never answered).
 
 ---
 

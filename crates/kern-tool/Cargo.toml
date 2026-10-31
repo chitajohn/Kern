@@ -27,3 +27,12 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 mockito = { workspace = true }
+
+# Hermetic MCP fixture: an integration test needs a real stdio server, and
+# spawning one as a test-owned binary keeps the suite free of node/python.
+[[bin]]
+name = "kern_mcp_stub"
+path = "tests/support/mcp_stub_server.rs"
+test = false
+bench = false
+doc = false

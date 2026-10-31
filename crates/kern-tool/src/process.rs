@@ -183,17 +183,22 @@ mod job {
 }
 
 /// A child that is always killed (tree-wide) when dropped (see module docs).
-struct ChildGuard {
+///
+/// Public because MCP servers are long-lived children with the same
+/// containment contract: dropping the `Arc<Tool>` that owns the server must
+/// take the whole process tree down (an `npx` launcher leaves a `node`
+/// grandchild that a direct-child kill would orphan).
+pub struct ContainedChild {
     child: Child,
     /// Windows: the job owning this run's process tree.
     #[cfg(windows)]
     job: Option<job::JobObject>,
 }
 
-impl ChildGuard {
+impl ContainedChild {
     /// Spawn `cmd` into a fresh process group (unix) or job object (Windows),
     /// so `kill_tree` can reach every descendant.
-    fn spawn(mut cmd: Command, memory_limit: Option<u64>) -> std::io::Result<Self> {
+    pub fn spawn(mut cmd: Command, memory_limit: Option<u64>) -> std::io::Result<Self> {
         #[cfg(unix)]
         cmd.process_group(0);
         let child = cmd.spawn()?;
@@ -234,13 +239,29 @@ impl ChildGuard {
         Some(job)
     }
 
-    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
+    }
+
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.child.stderr.take()
     }
 
     /// Kill the direct child and its entire tree. `start_kill` is sync (unlike
     /// `kill`), so this is safe in `Drop`.
-    fn kill_tree(&mut self) {
+    pub fn kill_tree(&mut self) {
         #[cfg(windows)]
         if let Some(job) = &self.job {
             job.terminate();
@@ -253,7 +274,7 @@ impl ChildGuard {
     }
 }
 
-impl Drop for ChildGuard {
+impl Drop for ContainedChild {
     fn drop(&mut self) {
         // Best-effort: the process may already be reaped.
         self.kill_tree();
@@ -270,17 +291,13 @@ pub async fn run_captured(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     // Spawns into its own process group / job object so the whole tree
     // (including backgrounded grandchildren) can be killed atomically.
-    let mut child = ChildGuard::spawn(cmd, limits.memory_limit_bytes)
+    let mut child = ContainedChild::spawn(cmd, limits.memory_limit_bytes)
         .map_err(|e| ToolError::Failed(format!("spawn failed: {e}")))?;
     let stdout = child
-        .child
-        .stdout
-        .take()
+        .take_stdout()
         .expect("stdout must be piped before spawn");
     let stderr = child
-        .child
-        .stderr
-        .take()
+        .take_stderr()
         .expect("stderr must be piped before spawn");
 
     let inner = async {
@@ -456,8 +473,8 @@ mod tests {
         // so poll `kill -0` (which succeeds on zombies) until it fails.
         let mut cmd = sh_cmd("sleep 30");
         piped(&mut cmd);
-        let child = ChildGuard::spawn(cmd, None).expect("spawn must succeed; sh is present");
-        let pid = child.child.id().expect("spawned child has a pid");
+        let child = ContainedChild::spawn(cmd, None).expect("spawn must succeed; sh is present");
+        let pid = child.id().expect("spawned child has a pid");
         drop(child);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

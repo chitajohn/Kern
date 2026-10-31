@@ -15,7 +15,7 @@ rust-version = "1.90"
 description = "Kern — the open-source runtime for reliable, long-running AI agents."
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "fs", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "fs", "net", "io-util"] }
 axum = "0.8"
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }

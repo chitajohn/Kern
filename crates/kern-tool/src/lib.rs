@@ -12,6 +12,7 @@
 pub mod builtins;
 pub mod error;
 pub mod executor;
+pub mod mcp;
 pub mod path;
 pub mod process;
 pub mod registry;
@@ -19,5 +20,6 @@ pub mod registry;
 pub use builtins::shell::{CommandRequest, CommandRunner, ShellTool, SystemRunner};
 pub use error::ToolError;
 pub use executor::{ToolExecutor, DEFAULT_GLOBAL_CAP, DEFAULT_PER_AGENT_CAP};
-pub use process::{CommandOutput, RunLimits, DEFAULT_OUTPUT_CAP};
+pub use mcp::{McpServer, McpServerSpec, MCP_PROTOCOL_VERSION};
+pub use process::{CommandOutput, ContainedChild, RunLimits, DEFAULT_OUTPUT_CAP};
 pub use registry::{MemoryEntry, MemoryProvider, Tool, ToolContext, ToolRegistry};
