@@ -35,14 +35,48 @@ checkpoint instead of starting over.
 
 ---
 
-## Quick Start
+## Install
 
-Requires Rust 1.90+ (stable, pinned in `rust-toolchain.toml`). Everything is local: no account, no cloud, no hosted database.
+No clone and no Rust toolchain needed -- the release binaries are self-contained:
+
+**macOS / Linux**
 
 ```bash
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+curl -fsSL https://raw.githubusercontent.com/chitajohn/Kern/main/scripts/install.sh | sh
+```
 
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/chitajohn/Kern/main/scripts/install.ps1 | iex
+```
+
+Prebuilt binaries cover x86_64 and aarch64 Linux, x86_64 and aarch64 macOS, and x86_64
+Windows. The installers verify the published SHA-256, drop `kern` in a per-user directory
+(`~/.local/bin` on Unix, `%LOCALAPPDATA%\Kern\bin` on Windows), and put it on your `PATH`.
+
+Override the version or location with `KERN_VERSION` and `KERN_INSTALL_DIR`
+(`-Version` / `-InstallDir` on Windows), or pin a release explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chitajohn/Kern/main/scripts/install.sh | KERN_VERSION=0.1.0 sh
+```
+
+**From source** (requires Rust 1.90+, pinned in `rust-toolchain.toml`) -- no repo clone either:
+
+```bash
+cargo install --git https://github.com/chitajohn/Kern kern-runtime
+# or, once it is on crates.io:
+cargo install kern-runtime
+```
+
+---
+
+## Quick Start
+
+Everything is local: no account, no cloud, no hosted database.
+
+```bash
 kern init            # creates ~/.kern, API token, and a commented agent.yaml
 kern daemon          # starts the runtime (keep this terminal open)
 ```

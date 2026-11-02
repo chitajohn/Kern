@@ -1220,26 +1220,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kern-cli"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chrono",
- "clap",
- "kern-core",
- "kern-model",
- "libc",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "kern-core"
 version = "0.1.0"
 dependencies = [
@@ -1281,6 +1261,26 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "kern-runtime"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "clap",
+ "kern-core",
+ "kern-model",
+ "libc",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
