@@ -181,7 +181,7 @@ created  starting  running  paused  waiting  sleeping  recovering  completed  fa
 ## 5. Storage schema (normative DDL)
 
 Database: `$KERN_HOME/state.db` (SQLite, WAL mode, `foreign_keys=ON`).
-Current schema version: **4** (migrations are transactional; `PRAGMA user_version` and
+Current schema version: **5** (migrations are transactional; `PRAGMA user_version` and
 `kern_meta.schema_version` are updated atomically).
 
 ```sql
@@ -285,6 +285,21 @@ CREATE TABLE permission_requests (
   requested_at TEXT NOT NULL,
   decided_at   TEXT
 );
+
+-- v5: mid-run operator input (ARCHITECTURE.md §30). Durable and
+-- execution-scoped: a queued message survives a crash, and a stale message is
+-- never delivered to a later run.
+CREATE TABLE agent_messages (
+  id           TEXT PRIMARY KEY,
+  agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  execution_id TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  status       TEXT NOT NULL,  -- queued | delivered | expired
+  created_at   TEXT NOT NULL,
+  delivered_at TEXT
+);
+CREATE INDEX ix_agent_messages_pending
+  ON agent_messages(execution_id, status);
 ```
 
 **Rules**
@@ -319,6 +334,7 @@ Envelope: `{ "seq": 12, "ts": "…", "kind": "tool.completed", "agent_id": "…"
 | `agent.sleeping` | `{ "agent_id", "wake_at" }` |
 | `agent.resumed` | `{ "agent_id", "checkpoint_id" | null }` |
 | `agent.thinking` | `{ "agent_id", "step", "text" }` |
+| `agent.message_received` | `{ "agent_id", "message_id", "step", "text" }` — an operator message was appended to a live session at a safe point (§30) |
 | `agent.waiting` | `{ "agent_id", "permission_request_id", "resource", "action" }` |
 | `agent.completed` | `{ "agent_id", "execution_id", "final_text" }` |
 | `agent.failed` | `{ "agent_id", "execution_id", "error": {…} }` |
@@ -391,6 +407,10 @@ Errors are structured per §13 and appear in payloads as `{ "code", "message", "
 Normative behavior (order matters):
 
 1. Load session (fresh or restored).
+1a. **Deliver queued operator input** (§30): every `agent_messages` row still `queued` for this
+   execution is appended as a user message, marked `delivered` in the same transaction, emitted
+   as `agent.message_received` with the current step, and covered by an immediate checkpoint.
+   This is a safe point, so delivery never interrupts a model or tool call.
 2. Build completion request: system prompt (+ optional memory digest) + bounded history + tool
    specs (only tools the agent is configured with) + durable variables.
 3. Emit `model.requested`. Call gateway with timeout/retries. **Model calls are at-least-once**
@@ -799,6 +819,7 @@ Base path: `/api/v1`. Content type: `application/json`. Errors: §13 shape.
 | `GET /agents` | — | `200` `[agent]` | |
 | `GET /agents/{id}` | — | `200` agent | includes `last_error`, summary counts |
 | `POST /agents/{id}/start` | — | `202` `{ "execution_id" }` | |
+| `POST /agents/{id}/messages` | `{ "text" }` | `202` `{ "message_id", "execution_id", "status": "queued" }` | queue operator input for a **live** run; delivered at the next safe point. `409 INVALID_TRANSITION` without a runner, `400` on empty text |
 | `POST /agents/{id}/pause` | — | `202` | |
 | `POST /agents/{id}/resume` | — | `202` | |
 | `POST /agents/{id}/terminate` | — | `202` | |
@@ -856,6 +877,7 @@ data: {…}
 | `kern logs <name\|id>` | tail events (follow with `-f`) |
 | `kern inspect <name\|id>` | agent detail + latest checkpoint summary + last error |
 | `kern pause\|resume\|checkpoint\|terminate <name\|id>` | lifecycle control |
+| `kern message <name\|id> "text"` | send a running agent a message; delivered at its next safe point (§30) |
 | `kern tools` / `kern models` | capability discovery |
 | `kern version` | version + API address |
 

@@ -102,6 +102,13 @@ enum Command {
         /// Agent name or id.
         target: String,
     },
+    /// Send a running agent a message (delivered at its next safe point).
+    Message {
+        /// Agent name or id.
+        target: String,
+        /// The message text.
+        text: String,
+    },
     /// Terminate an agent.
     Terminate {
         /// Agent name or id.
@@ -175,6 +182,7 @@ async fn dispatch(cli: Cli) -> Result<i32, String> {
         Command::Pause { target } => cmd_lifecycle(&target, "pause", "paused").await,
         Command::Resume { target } => cmd_lifecycle(&target, "resume", "resumed").await,
         Command::Checkpoint { target } => cmd_checkpoint(&target).await,
+        Command::Message { target, text } => cmd_message(&target, &text).await,
         Command::Terminate { target } => cmd_lifecycle(&target, "terminate", "terminated").await,
         Command::Tools => cmd_tools().await,
         Command::Models => cmd_models().await,
@@ -315,6 +323,25 @@ async fn run_until_terminal(client: &Client, id: &str, name: &str) -> Result<i32
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// `kern message <agent> "text"` — queue operator input for a live run.
+async fn cmd_message(target: &str, text: &str) -> Result<i32, String> {
+    if text.trim().is_empty() {
+        return Err("message text must not be empty".to_string());
+    }
+    let client = Client::from_env().map_err(|e| e.to_string())?;
+    let id = client.resolve_agent(target).await.map_err(display_client)?;
+    let response = client
+        .send_message(&id, text)
+        .await
+        .map_err(display_client)?;
+    println!(
+        "queued message {} for execution {} (delivered at the next safe point)",
+        response["message_id"].as_str().unwrap_or("?"),
+        response["execution_id"].as_str().unwrap_or("?"),
+    );
+    Ok(0)
 }
 
 async fn cmd_ps() -> Result<i32, String> {

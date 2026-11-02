@@ -1027,6 +1027,7 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 | D29 | Windows tool containment is a per-run job object in the transport layer (`kern-tool::process`), not a `kern-core::sandbox` backend: `KILL_ON_JOB_CLOSE` + optional `ProcessMemoryLimit` make the tree kill and the memory cap platform-uniform, while job objects still isolate no filesystem or network — so the sandbox matrix keeps `required` fail-closed on Windows rather than claiming a boundary it does not enforce |
 | D30 | MCP servers are connected at registry build (start/resume), only for servers the agent actually names in `tools`; remote tools are exposed as `<server>.<tool>` under a new `mcp` permission class (default deny); the child is env-scrubbed and tree-contained (D29); a server that cannot start, or does not expose a requested tool, fails the start. Transports are stdio only; server-initiated requests are ignored. |
 | D31 | Token streaming is observational only: `runtime.stream` (default off) makes `ModelGateway::complete_streaming` push deltas through a channel to transient `model.delta` events (`seq = 0`, never persisted, never replayed); the turn is still recorded from the final response; a streaming attempt is never retried, because a replay would duplicate text the client already saw. All three builtin adapters parse their native stream — OpenAI-compatible SSE, Anthropic Messages SSE, and Ollama's newline-delimited JSON — including tool calls that arrive in fragments or whole chunks; a third-party adapter that does not override `stream` falls back to one whole-text delta. |
+| D32 | Mid-run operator input is a **durable, execution-scoped inbox**, not an interrupt: `agent_messages` (schema v5) rows are queued by `POST /agents/{id}/messages`, taken atomically at the runner's next safe point, appended as user messages, emitted as `agent.message_received` at the step they land, and checkpointed immediately after. Refused without a live runner (`409`), expired at execution end so a message is never silently lost, and never preempts a model or tool call in flight — the runtime never has to unwind recorded work (§30). |
 
 ## 24. Execution budgets and failure containment
 
@@ -1366,3 +1367,59 @@ Every builtin adapter parses its native stream; the trait default (one delta at 
 remains only for third-party adapters that do not override `stream`. There is no
 client-side resume of a partially received stream — that requires the durable-stream
 abstraction §24.5 still defers.
+
+## 30. Mid-run operator input
+
+### 30.1 The gap
+
+Streaming (§29) made a run *observable* while it happens; nothing made it *addressable*. Once a
+turn started, the only way to influence the agent was to wait for it to finish, `pause` it, or
+`terminate` it. For long-running agents — the whole point of the runtime — that is the wrong
+trade: an operator watching a tool batch go sideways usually has one sentence that would fix
+the next turn.
+
+### 30.2 The design: a durable inbox, not an interrupt
+
+An interrupt would have to unwind a model or tool call in flight, which means either cancelling
+a recorded side effect or discarding a checkpoint mid-batch. Instead a message is **queued** and
+delivered at the same safe points the runner already honours (pause, checkpoint, shutdown):
+
+```
+POST /agents/{id}/messages { "text" }   → 202 { message_id, execution_id, status: queued }
+        │
+        └── agent_messages row (schema v5): status=queued, execution-scoped
+                 │
+                 ▼  runner reaches a safe point (top of the loop, before the next model call)
+        take_queued_messages(execution_id)   → all rows atomically flipped to delivered
+                 │
+                 ├── session.messages += user(text)      (the model sees it next turn)
+                 ├── agent.message_received {step, text} (transcript, at the step it landed)
+                 └── checkpoint_now("running")           (part of the durable rollback point)
+```
+
+### 30.3 Rules
+
+- **Only live runs.** With no runner, the route returns `409 INVALID_TRANSITION`: a queued
+  message with nothing to deliver it would either linger forever or, worse, land on a later
+  run. A new turn is `POST /agents/{id}/start`.
+- **Exactly once.** Rows flip to `delivered` in the same transaction that reads them, so a
+  message can never be handed to the runner twice — the same discipline as tool-call dedup
+  (§11.2).
+- **Durable.** The row is written before the 202 returns, and the checkpoint immediately after
+  delivery means a crash between delivery and the next model call resumes with the message
+  already in the session.
+- **Ordered.** Delivery follows insertion (`rowid`) order, which is what an operator typing two
+  sentences expects.
+- **Never silently lost.** A message that arrives after the execution's last safe point is
+  marked `expired` when the run ends (and logged) rather than staying `queued` as a phantom.
+  A paused or sleeping agent keeps its queue: the same execution resumes.
+- **No interruption.** A model call in flight completes and its result is still recorded; the
+  message lands *after* it. That is a deliberate semantic, not a limitation to be papered over:
+  the runtime never has to unwind recorded work.
+
+### 30.4 Gaps
+
+There is no priority path that preempts a long model call, no mid-stream steering (a delta
+stream is not a conversation), and no client-side delivery receipt beyond the
+`agent.message_received` event and the row status. Multi-agent conversation (message an agent
+*from* an agent) remains the deferred agent-to-agent work in §25.3.

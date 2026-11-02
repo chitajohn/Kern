@@ -11,8 +11,13 @@ use crate::error::{ErrorCode, KernError, Result};
 use crate::store::new_id;
 use crate::version::STORAGE_SCHEMA_VERSION;
 
-pub(crate) const MIGRATIONS: &[&dyn Migration] =
-    &[&MigrationV1, &MigrationV2, &MigrationV3, &MigrationV4];
+pub(crate) const MIGRATIONS: &[&dyn Migration] = &[
+    &MigrationV1,
+    &MigrationV2,
+    &MigrationV3,
+    &MigrationV4,
+    &MigrationV5,
+];
 
 pub(crate) trait Migration {
     fn version(&self) -> u32;
@@ -77,6 +82,39 @@ impl Migration for MigrationV4 {
         tx.execute_batch("ALTER TABLE executions ADD COLUMN wake_at TEXT;")
     }
 }
+
+struct MigrationV5;
+
+impl Migration for MigrationV5 {
+    fn version(&self) -> u32 {
+        5
+    }
+
+    fn name(&self) -> &'static str {
+        "v5-agent-messages"
+    }
+
+    fn up(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        // Mid-run operator messages (ARCHITECTURE.md §30): durable so a queued
+        // message survives a crash, and execution-scoped so a stale message is
+        // never delivered to a later run.
+        tx.execute_batch(SCHEMA_V5)
+    }
+}
+
+const SCHEMA_V5: &str = r#"
+CREATE TABLE agent_messages (
+  id           TEXT PRIMARY KEY,
+  agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  execution_id TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  delivered_at TEXT
+);
+CREATE INDEX ix_agent_messages_pending
+  ON agent_messages(execution_id, status);
+"#;
 
 struct MigrationV3;
 

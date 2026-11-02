@@ -82,6 +82,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{id}", get(get_agent))
         .route("/agents/{id}/start", post(start_agent))
+        .route("/agents/{id}/messages", post(message_agent))
         .route("/agents/{id}/pause", post(pause_agent))
         .route("/agents/{id}/resume", post(resume_agent))
         .route("/agents/{id}/terminate", post(terminate_agent))
@@ -406,6 +407,66 @@ async fn start_agent(
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "execution_id": execution_id })),
+    ))
+}
+
+/// Body of `POST /agents/{id}/messages`.
+#[derive(Debug, Deserialize)]
+struct MessageBody {
+    text: String,
+}
+
+/// `POST /agents/{id}/messages` — queue operator input for a **live** run
+/// (202). The runner appends it at its next safe point, so a long model or tool
+/// call is never interrupted (ARCHITECTURE §30).
+///
+/// Refused with `409 INVALID_TRANSITION` when no runner is live: use
+/// `POST /agents/{id}/start` for a new turn. Empty text is `400`.
+async fn message_agent(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<String>,
+    body: Result<Json<MessageBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let body = body.map_err(|rej| {
+        let status = rej.into_response().status();
+        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "REQUEST_TOO_LARGE"
+        } else {
+            "CONFIG_INVALID"
+        };
+        ApiError::new(
+            status,
+            code,
+            "request body must be JSON { \"text\": \"...\" }",
+            None,
+        )
+    })?;
+    let text = body.0.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "CONFIG_INVALID",
+            "message text must not be empty",
+            None,
+        ));
+    }
+    // Existence before state: an unknown agent is 404, not 409.
+    state
+        .store
+        .get_agent(&agent_id)
+        .map_err(ApiError::from_kern)?;
+    let message = state
+        .engine
+        .message_agent(&agent_id, text)
+        .await
+        .map_err(ApiError::from_kern)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "message_id": message.id,
+            "execution_id": message.execution_id,
+            "status": message.status.as_str(),
+        })),
     ))
 }
 

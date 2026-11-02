@@ -1373,3 +1373,106 @@ async fn streaming_broadcasts_deltas_without_persisting_them() {
     assert!(persisted.iter().any(|k| k == "model.completed"));
     assert!(persisted.iter().any(|k| k == "agent.completed"));
 }
+
+// ---------------------------------------------------------------------------
+// Mid-run operator input (ARCHITECTURE §30)
+// ---------------------------------------------------------------------------
+
+/// Wait until an event of `kind` is durable (polling the store, like
+/// `wait_for_state` — no reliance on in-memory signals).
+async fn wait_for_event_kind(store: &Store, kind: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let kinds: Vec<String> = store
+            .events_after(0, 500)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        if kinds.iter().any(|k| k == kind) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "event {kind} never appeared");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn operator_message_reaches_the_model_at_the_next_safe_point() {
+    // The sleep tool keeps the runner inside a call long enough to queue a
+    // message behind it: delivery must happen afterwards, at the safe point.
+    let env = TestEnv::new(vec![
+        ScriptedStep::ToolCalls(vec![tool_call("c1", "sleep", json!({ "ms": 400 }))]),
+        ScriptedStep::Finish("done".into()),
+    ]);
+    let agent_id = env.create_agent(
+        "version: 1\nname: chatty\ntools:\n  - sleep\nmodel:\n  provider: mock\n  model: test\n",
+    );
+
+    let engine = env.engine.clone();
+    let spawn_agent_id = agent_id.clone();
+    let run = tokio::spawn(async move { engine.run_agent(&spawn_agent_id, Some("start")).await });
+
+    // The tool has started and is still running: the runner is between safe
+    // points, which is exactly the window this feature exists for.
+    wait_for_event_kind(&env.store, "tool.started").await;
+    let message = env
+        .engine
+        .message_agent(&agent_id, "also check the logs")
+        .await
+        .expect("a live runner accepts a message");
+
+    let summary: RunSummary = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("run must finish within 10s")
+        .expect("runner task must not panic")
+        .unwrap();
+    let RunOutcome::Completed { final_text, .. } = &summary.outcome else {
+        panic!("expected completion, got {:?}", summary.outcome);
+    };
+    assert_eq!(final_text, "done");
+
+    // The model saw it: the second request carries the operator message.
+    let requests = env.provider.take_requests();
+    assert!(requests.len() >= 2, "expected a second model call");
+    let last = requests.last().unwrap();
+    assert!(
+        last.messages
+            .iter()
+            .any(|m| m.role == kern_model::Role::User && m.content == "also check the logs"),
+        "second request must include the operator message: {:?}",
+        last.messages
+    );
+
+    // Durably delivered, exactly once, and observable in the transcript.
+    let rows = env
+        .store
+        .messages_for_execution(&summary.execution_id)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, message.id);
+    assert_eq!(rows[0].status, crate::store::MessageStatus::Delivered);
+    let kinds = env.kinds();
+    assert!(
+        kinds.contains(&"agent.message_received".to_string()),
+        "kinds: {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn message_without_a_live_runner_is_refused() {
+    let env = TestEnv::new(vec![ScriptedStep::Finish("done".into())]);
+    let agent_id = env.create_agent(
+        "version: 1\nname: idle\nmodel:\n  provider: mock\n  model: test\ntools:\n  - noop\n",
+    );
+
+    let err = env
+        .engine
+        .message_agent(&agent_id, "anyone there?")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidTransition, "{err:?}");
+    // Nothing was queued: a message with no runner to reach it must not linger.
+    let executions = env.store.list_executions_for_agent(&agent_id).unwrap();
+    assert!(executions.is_empty());
+}

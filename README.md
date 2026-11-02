@@ -27,7 +27,9 @@ checkpoint instead of starting over.
 
 - **Sandboxing** -- Platform-specific isolation, fail-closed. Linux: bubblewrap, landlock, rlimit fallback. macOS: sandbox-exec (seatbelt). Windows: job objects (process-tree containment + memory cap; no filesystem or network isolation, so `required` fails closed).
 
-- **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE. With `runtime.stream: true`, model text also streams live as transient `model.delta` events (never persisted — the turn is still recorded from the final response).
+- **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE. With `runtime.stream: true`, model text also streams live as transient `model.delta` events (never persisted — the turn is still recorded from the final response). Every builtin adapter streams its native protocol (OpenAI SSE, Anthropic Messages SSE, Ollama NDJSON).
+
+- **Live steering** -- A running agent is addressable, not just observable: `kern message <agent> "..."` queues input that the runner appends at its next safe point, so you can correct course mid-run without pausing, terminating, or interrupting the call in flight. Messages are durable and delivered exactly once.
 
 - **Scheduling** -- Agents can run on an interval or cron schedule with crash-safe scheduling state.
 
@@ -119,6 +121,7 @@ The CLI is a control interface to the runtime, not the runtime itself. It talks 
 | `kern logs <agent> [-f]` | Durable event replay (or follow live) |
 | `kern inspect <agent>` | Spec summary, state, latest checkpoint |
 | `kern pause` / `resume` / `checkpoint` / `terminate` | Lifecycle control |
+| `kern message <agent> "text"` | Send a running agent a message (delivered at its next safe point) |
 | `kern permissions` / `grant` / `deny` | Resolve `waiting` agents' `ask` requests |
 | `kern schedule <agent>` | Show next scheduled runs |
 | `kern tools` / `kern models` | Runtime capability inventory |
