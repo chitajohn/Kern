@@ -1026,7 +1026,7 @@ run on the dev profile with HTML reports disabled to keep workspace disk bounded
 | D27 | Linux sandbox tier gains `landlock` (kernel LSM write containment, empirically probed ABI mask; no-`bwrap` `required` works on Linux ≥ 5.13); tool subprocess envs are scrubbed to a non-secret allowlist for every backend (credential boundary); approval TTL via schema v2 (`expires_at` + `PERMISSION_REQUEST_EXPIRED`, expired ≡ denied); opt-in event retention (`KERN_EVENT_RETENTION`); gated real-provider tests (`AGENTROUTER_API_KEY`, self-skipping). Deferred items (routing → app layer, no streaming in v0.1, agent-to-agent/SDK post-v0.1 — MCP is no longer deferred, see D30) are recorded in §19 and §25.3 |
 | D29 | Windows tool containment is a per-run job object in the transport layer (`kern-tool::process`), not a `kern-core::sandbox` backend: `KILL_ON_JOB_CLOSE` + optional `ProcessMemoryLimit` make the tree kill and the memory cap platform-uniform, while job objects still isolate no filesystem or network — so the sandbox matrix keeps `required` fail-closed on Windows rather than claiming a boundary it does not enforce |
 | D30 | MCP servers are connected at registry build (start/resume), only for servers the agent actually names in `tools`; remote tools are exposed as `<server>.<tool>` under a new `mcp` permission class (default deny); the child is env-scrubbed and tree-contained (D29); a server that cannot start, or does not expose a requested tool, fails the start. Transports are stdio only; server-initiated requests are ignored. |
-| D31 | Token streaming is observational only: `runtime.stream` (default off) makes `ModelGateway::complete_streaming` push deltas through a channel to transient `model.delta` events (`seq = 0`, never persisted, never replayed); the turn is still recorded from the final response; a streaming attempt is never retried, because a replay would duplicate text the client already saw. OpenAI-compatible adapters stream SSE (including fragmented tool calls); other adapters fall back to one whole-text delta. |
+| D31 | Token streaming is observational only: `runtime.stream` (default off) makes `ModelGateway::complete_streaming` push deltas through a channel to transient `model.delta` events (`seq = 0`, never persisted, never replayed); the turn is still recorded from the final response; a streaming attempt is never retried, because a replay would duplicate text the client already saw. All three builtin adapters parse their native stream — OpenAI-compatible SSE, Anthropic Messages SSE, and Ollama's newline-delimited JSON — including tool calls that arrive in fragments or whole chunks; a third-party adapter that does not override `stream` falls back to one whole-text delta. |
 
 ## 24. Execution budgets and failure containment
 
@@ -1337,8 +1337,9 @@ exactly where it was — no partial assistant message, no half-recorded tool cal
 ModelGateway::complete_streaming(req, &DeltaSender)   // one attempt, model.timeout
   └── ModelProvider::stream(req, &DeltaSender)        // trait method, default = whole text
         ├── OpenAI adapter: SSE frames, tool-call fragments accumulated by index
-        ├── mock: deterministic 8-char chunks (engine tests)
-        └── Anthropic / Ollama: default fallback (one delta at completion)
+        ├── Anthropic: Messages SSE (`text_delta`, fragmented `input_json_delta` / `tool_use`)
+        ├── Ollama: newline-delimited JSON chunks (`message.content`, whole `tool_calls`)
+        └── mock: deterministic 8-char chunks (engine tests)
   └── engine: forward task drains the channel → EventBus::emit_transient(ModelDelta)
         └── broadcast → GET /events/stream (seq 0 always forwarded, cursor unchanged)
 ```
@@ -1361,6 +1362,7 @@ ModelGateway::complete_streaming(req, &DeltaSender)   // one attempt, model.time
 
 ### 29.4 Gaps
 
-Anthropic and Ollama fall back to a single whole-text delta (their native event streams are
-not parsed yet). There is no client-side resume of a partially received stream — that
-requires the durable-stream abstraction §24.5 still defers.
+Every builtin adapter parses its native stream; the trait default (one delta at completion)
+remains only for third-party adapters that do not override `stream`. There is no
+client-side resume of a partially received stream — that requires the durable-stream
+abstraction §24.5 still defers.
