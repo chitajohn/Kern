@@ -13,6 +13,12 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.90"
 description = "Kern — the open-source runtime for reliable, long-running AI agents."
+repository = "https://github.com/chitajohn/Kern"
+homepage = "https://github.com/chitajohn/Kern"
+authors = ["Kern contributors"]
+keywords = ["agents", "ai", "runtime", "durable-execution"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "fs", "net", "io-util"] }

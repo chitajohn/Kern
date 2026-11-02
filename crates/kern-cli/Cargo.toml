@@ -1,10 +1,18 @@
+# Published as `kern-runtime`, not `kern-cli`: an unrelated project holds `kern-cli` on
+# crates.io. The directory and the `kern` binary name are unaffected.
 [package]
-name = "kern-cli"
+name = "kern-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Kern CLI: daemon and control interface (SPEC.md §16)."
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "kern"
@@ -14,8 +22,8 @@ path = "src/main.rs"
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-kern-core = { path = "../kern-core" }
-kern-model = { path = "../kern-model" }
+kern-core = { version = "0.1.0", path = "../kern-core" }
+kern-model = { version = "0.1.0", path = "../kern-model" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

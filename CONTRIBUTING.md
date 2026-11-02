@@ -85,6 +85,34 @@ the corresponding tests must pass -- not just compile.
 - **The engine loop:** Effectively-once tool semantics and restore behavior are
   load-bearing. Read them before editing `engine.rs`.
 
+## Releasing
+
+Releases are cut from a tag; the `Release` workflow builds the binaries the installers download.
+
+1. Bump `version` in the workspace `Cargo.toml` and run `cargo build --workspace` so
+   `Cargo.lock` matches.
+2. `git tag v0.1.1 && git push origin main --tags`.
+3. CI builds `kern` for x86_64/aarch64 Linux, x86_64/aarch64 macOS, and x86_64 Windows, packages
+   each as `kern-<version>-<target>.tar.gz` (or `.zip`) plus a `.sha256`, and attaches them to the
+   GitHub release. `scripts/install.sh` and `scripts/install.ps1` resolve `latest` from that
+   release, so nothing else has to be published for people to install.
+
+The asset names (`kern-<version>-<target>.<ext>`, one `kern`/`kern.exe` inside a directory) are a
+contract with the installers -- change all three together.
+
+The binary crate is published as `kern-runtime`: an unrelated project already holds `kern-cli` on
+crates.io. The directory stays `crates/kern-cli` and the installed binary is still `kern`.
+
+crates.io publishing is independent of releases and must go in dependency order, because each crate
+needs its dependencies on the registry first:
+
+```bash
+cargo publish -p kern-model
+cargo publish -p kern-tool
+cargo publish -p kern-core
+cargo publish -p kern-runtime
+```
+
 ## Getting Help
 
 - `ARCHITECTURE.md` -- design, decisions, limits audit
