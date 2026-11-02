@@ -5,6 +5,8 @@
 //! a deterministic scripted `mock` provider for tests. Adapters are raw
 //! `reqwest` calls (no provider SDKs) so the request/response contract is
 //! fully under our control and fixture-testable without live keys.
+//!
+//! `stream` holds the shared line framing every streaming adapter needs.
 
 pub mod anthropic;
 pub mod error;
@@ -13,6 +15,7 @@ pub mod mock;
 pub mod ollama;
 pub mod openai;
 pub mod provider;
+pub mod stream;
 pub mod types;
 
 pub use error::ModelError;

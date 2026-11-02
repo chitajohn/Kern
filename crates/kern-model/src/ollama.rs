@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::error::{from_status, ModelError};
 use crate::provider::ModelProvider;
+use crate::stream::LineReader;
 use crate::types::{CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -41,6 +42,22 @@ impl OllamaProvider {
             std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self::new(base_url)
     }
+
+    /// POST to `/api/chat`, mapping transport and status failures.
+    async fn post(&self, body: &Value) -> Result<reqwest::Response, ModelError> {
+        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| ModelError::Unavailable(format!("ollama transport error: {e}")))?;
+        if !response.status().is_success() {
+            return Err(from_status(response.status(), "ollama"));
+        }
+        Ok(response)
+    }
 }
 
 #[async_trait]
@@ -50,20 +67,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
-        let body = build_body(req);
-        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ModelError::Unavailable(format!("ollama transport error: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(from_status(response.status(), "ollama"));
-        }
+        let response = self.post(&build_body(req)).await?;
         if let Some(len) = response.content_length() {
             if len > MAX_RESPONSE_BYTES {
                 return Err(ModelError::InvalidResponse(format!(
@@ -76,6 +80,124 @@ impl ModelProvider for OllamaProvider {
         })?;
 
         normalize(&payload)
+    }
+
+    /// Stream `/api/chat` (`stream: true`), which is newline-delimited JSON:
+    /// each line is a complete partial message, and the last one carries
+    /// `done: true` plus `done_reason`.
+    ///
+    /// Ollama sends tool calls whole (not in fragments), so each line either
+    /// carries text, a finished set of tool calls, or the terminator.
+    async fn stream(
+        &self,
+        req: &CompletionRequest,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<CompletionResponse, ModelError> {
+        let mut body = build_body(req);
+        body["stream"] = json!(true);
+        let response = self.post(&body).await?;
+
+        let mut reader = LineReader::new(response, "ollama");
+        let mut state = StreamState::default();
+        while let Some(line) = reader.next_line().await? {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let event: Value = serde_json::from_str(line).map_err(|e| {
+                ModelError::InvalidResponse(format!("ollama stream event is not JSON: {e}"))
+            })?;
+            if let Some(error) = event.get("error").and_then(Value::as_str) {
+                return Err(ModelError::Unavailable(format!(
+                    "ollama stream error: {error}"
+                )));
+            }
+            state.apply(&event, deltas)?;
+            if event.get("done").and_then(Value::as_bool) == Some(true) {
+                return state.finish();
+            }
+        }
+        // A body that ends without `done` is still a complete turn.
+        state.finish()
+    }
+}
+
+/// Accumulates an Ollama NDJSON stream into one normalized response.
+#[derive(Default)]
+struct StreamState {
+    text: String,
+    calls: Vec<ToolCall>,
+    done_reason: Option<String>,
+}
+
+impl StreamState {
+    fn apply(
+        &mut self,
+        event: &Value,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<(), ModelError> {
+        if let Some(text) = event.pointer("/message/content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                self.text.push_str(text);
+                crate::provider::emit_delta(deltas, text);
+            }
+        }
+        if let Some(raw_calls) = event
+            .pointer("/message/tool_calls")
+            .and_then(Value::as_array)
+        {
+            // Tool calls arrive whole; a chunk that repeats the final set is
+            // idempotent because it replaces rather than appends.
+            let mut calls = Vec::with_capacity(raw_calls.len());
+            for (index, raw) in raw_calls.iter().enumerate() {
+                let function = raw.pointer("/function").ok_or_else(|| {
+                    ModelError::InvalidResponse("tool call missing function".to_string())
+                })?;
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ModelError::InvalidResponse("tool call missing name".to_string())
+                    })?
+                    .to_string();
+                let arguments = function
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
+                if !arguments.is_object() {
+                    return Err(ModelError::InvalidResponse(
+                        "tool call arguments must be a JSON object".to_string(),
+                    ));
+                }
+                calls.push(ToolCall {
+                    id: format!("ollama-{index}"),
+                    name,
+                    arguments,
+                });
+            }
+            if !calls.is_empty() {
+                self.calls = calls;
+            }
+        }
+        if let Some(reason) = event.get("done_reason").and_then(Value::as_str) {
+            self.done_reason = Some(reason.to_string());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<CompletionResponse, ModelError> {
+        if !self.calls.is_empty() {
+            return Ok(CompletionResponse::ToolCalls(self.calls));
+        }
+        let reason = match self.done_reason.as_deref() {
+            Some("length") => FinishReason::Length,
+            Some("stop") | None => FinishReason::Stop,
+            Some(other) => FinishReason::Other(other.to_string()),
+        };
+        Ok(CompletionResponse::Finish {
+            reason,
+            text: self.text,
+        })
     }
 }
 
@@ -363,5 +485,87 @@ mod tests {
         let provider = OllamaProvider::new(server.url());
         let err = provider.complete(&req()).await.unwrap_err();
         assert!(matches!(err, ModelError::InvalidResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_text_deltas_until_done() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/chat")
+            .match_body(mockito::Matcher::PartialJsonString(
+                json!({ "stream": true }).to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/x-ndjson")
+            .with_body(concat!(
+                "{\"model\":\"llama3.1\",\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n",
+                "{\"model\":\"llama3.1\",\"message\":{\"role\":\"assistant\",\"content\":\"lo!\"},\"done\":false}\n",
+                "{\"model\":\"llama3.1\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+            ))
+            .create();
+
+        let provider = OllamaProvider::new(server.url());
+        let (delta_tx, mut delta_rx) = crate::provider::delta_channel();
+        let response = provider.stream(&req(), &delta_tx).await.unwrap();
+        drop(delta_tx);
+        let mut deltas: Vec<String> = Vec::new();
+        while let Some(text) = delta_rx.recv().await {
+            deltas.push(text);
+        }
+
+        assert_eq!(deltas, vec!["Hel".to_string(), "lo!".to_string()]);
+        match response {
+            CompletionResponse::Finish { reason, text } => {
+                assert_eq!(reason, FinishReason::Stop);
+                assert_eq!(text, "Hello!");
+            }
+            other => panic!("expected finish, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn stream_assembles_whole_tool_calls() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/x-ndjson")
+            .with_body(concat!(
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[",
+                "{\"function\":{\"name\":\"filesystem\",\"arguments\":{\"path\":\"/tmp/x\"}}}",
+                "]},\"done\":false}\n",
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n",
+            ))
+            .create();
+
+        let provider = OllamaProvider::new(server.url());
+        let (delta_tx, _delta_rx) = crate::provider::delta_channel();
+        let response = provider.stream(&req(), &delta_tx).await.unwrap();
+        match response {
+            CompletionResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "ollama-0");
+                assert_eq!(calls[0].name, "filesystem");
+                assert_eq!(calls[0].arguments["path"], "/tmp/x");
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_field_is_a_provider_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/chat")
+            .with_status(200)
+            .with_header("content-type", "application/x-ndjson")
+            .with_body("{\"error\":\"model 'nope' not found\"}\n")
+            .create();
+        let provider = OllamaProvider::new(server.url());
+        let (delta_tx, _delta_rx) = crate::provider::delta_channel();
+        let err = provider.stream(&req(), &delta_tx).await.unwrap_err();
+        assert!(matches!(err, ModelError::Unavailable(_)), "{err:?}");
+        assert!(err.to_string().contains("not found"), "{err}");
     }
 }
