@@ -223,6 +223,56 @@ pub struct Execution {
     pub wake_at: Option<DateTime<Utc>>,
 }
 
+/// Delivery state of a mid-run operator message (schema v5, ARCHITECTURE §30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageStatus {
+    /// Waiting for the runner to reach a safe point.
+    Queued,
+    /// Appended to the session and visible to the model.
+    Delivered,
+    /// The execution ended before the message could be delivered.
+    Expired,
+}
+
+impl MessageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageStatus::Queued => "queued",
+            MessageStatus::Delivered => "delivered",
+            MessageStatus::Expired => "expired",
+        }
+    }
+}
+
+impl std::str::FromStr for MessageStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(MessageStatus::Queued),
+            "delivered" => Ok(MessageStatus::Delivered),
+            "expired" => Ok(MessageStatus::Expired),
+            _ => Err(format!("invalid message status: {s}")),
+        }
+    }
+}
+
+/// An operator message queued for a live execution (schema v5).
+///
+/// Queued rows are durable: the message survives a crash and is delivered at the
+/// runner's next safe point, exactly like a tool result.
+#[derive(Debug, Clone)]
+pub struct AgentMessage {
+    pub id: String,
+    pub agent_id: String,
+    pub execution_id: String,
+    pub text: String,
+    pub status: MessageStatus,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
 impl Execution {
     pub fn new(agent_id: impl Into<String>, status: ExecutionStatus) -> Self {
         Self {

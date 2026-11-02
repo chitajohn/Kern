@@ -49,6 +49,11 @@ pub enum EventKind {
     AgentResumed,
     #[serde(rename = "agent.thinking")]
     AgentThinking,
+    /// An operator message was appended to a live session (ARCHITECTURE §30).
+    /// Emitted at the safe point where the runner actually consumed it, so the
+    /// transcript shows the step the model saw it at.
+    #[serde(rename = "agent.message_received")]
+    AgentMessageReceived,
     #[serde(rename = "agent.waiting")]
     AgentWaiting,
     #[serde(rename = "agent.sleeping")]
@@ -108,7 +113,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// All catalog kinds in catalog order (`SPEC.md §6`).
-    pub const ALL: [EventKind; 33] = [
+    pub const ALL: [EventKind; 34] = [
         EventKind::RuntimeStarted,
         EventKind::RuntimeShuttingDown,
         EventKind::AgentCreated,
@@ -116,6 +121,7 @@ impl EventKind {
         EventKind::AgentPaused,
         EventKind::AgentResumed,
         EventKind::AgentThinking,
+        EventKind::AgentMessageReceived,
         EventKind::AgentWaiting,
         EventKind::AgentSleeping,
         EventKind::AgentCompleted,
@@ -154,6 +160,7 @@ impl EventKind {
             EventKind::AgentPaused => "agent.paused",
             EventKind::AgentResumed => "agent.resumed",
             EventKind::AgentThinking => "agent.thinking",
+            EventKind::AgentMessageReceived => "agent.message_received",
             EventKind::AgentWaiting => "agent.waiting",
             EventKind::AgentSleeping => "agent.sleeping",
             EventKind::AgentCompleted => "agent.completed",
@@ -196,6 +203,7 @@ impl FromStr for EventKind {
             "agent.paused" => Ok(EventKind::AgentPaused),
             "agent.resumed" => Ok(EventKind::AgentResumed),
             "agent.thinking" => Ok(EventKind::AgentThinking),
+            "agent.message_received" => Ok(EventKind::AgentMessageReceived),
             "agent.waiting" => Ok(EventKind::AgentWaiting),
             "agent.sleeping" => Ok(EventKind::AgentSleeping),
             "agent.completed" => Ok(EventKind::AgentCompleted),
@@ -471,6 +479,10 @@ mod tests {
         ("agent.resumed", &["agent_id", "checkpoint_id"]),
         ("agent.thinking", &["agent_id", "step", "text"]),
         (
+            "agent.message_received",
+            &["agent_id", "message_id", "step", "text"],
+        ),
+        (
             "agent.waiting",
             &["agent_id", "permission_request_id", "resource", "action"],
         ),
@@ -603,6 +615,11 @@ mod tests {
                 EventKind::AgentThinking,
                 payload::agent_thinking("a", 3, "working"),
                 &["agent_id", "step", "text"],
+            ),
+            (
+                EventKind::AgentMessageReceived,
+                payload::agent_message_received("a", "msg-1", 3, "also check the logs"),
+                &["agent_id", "message_id", "step", "text"],
             ),
             (
                 EventKind::AgentWaiting,

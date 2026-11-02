@@ -1060,3 +1060,107 @@ async fn malformed_and_oversized_requests_are_rejected() {
     // None of the attacks created an agent.
     assert!(server.store.list_agents().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Mid-run operator messages (ARCHITECTURE §30)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn message_route_queues_input_for_a_live_run_and_refuses_an_idle_agent() {
+    // The 400 ms sleep tool keeps the run live long enough for the route to
+    // accept a message, which the runner then delivers at its safe point.
+    let server = spawn_server(
+        vec![
+            ScriptedStep::ToolCalls(vec![ToolCall {
+                id: "c1".into(),
+                name: "sleep".into(),
+                arguments: json!({ "ms": 400 }),
+            }]),
+            ScriptedStep::Finish("done".into()),
+        ],
+        None,
+    )
+    .await;
+    let client = server.client();
+
+    let (status, agent) = server
+        .create_agent(spec("chatty", &["sleep"], json!({})))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let agent_id = agent["id"].as_str().unwrap().to_string();
+
+    // No runner yet: 409 with the structured error shape (start a run instead).
+    let resp = client
+        .post(server.url(&format!("/agents/{agent_id}/messages")))
+        .json(&json!({ "text": "hello?" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "INVALID_TRANSITION");
+
+    // Empty text is a 400, not a queued blank message.
+    let resp = client
+        .post(server.url(&format!("/agents/{agent_id}/messages")))
+        .json(&json!({ "text": "   " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Unknown agent is a 404.
+    let resp = client
+        .post(server.url("/agents/nope/messages"))
+        .json(&json!({ "text": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Start, wait for the tool to be in flight, then queue.
+    let resp = client
+        .post(server.url(&format!("/agents/{agent_id}/start")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let started: Value = resp.json().await.unwrap();
+    let execution_id = started["execution_id"].as_str().unwrap().to_string();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let events = server.store.events_after(0, 1000).unwrap();
+        if events.iter().any(|e| e.kind == "tool.started") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "tool never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let resp = client
+        .post(server.url(&format!("/agents/{agent_id}/messages")))
+        .json(&json!({ "text": "also check the logs" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let queued: Value = resp.json().await.unwrap();
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(queued["execution_id"], execution_id.as_str());
+
+    server
+        .wait_for_state(&agent_id, LifecycleState::Completed)
+        .await;
+
+    let rows = server.store.messages_for_execution(&execution_id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, queued["message_id"].as_str().unwrap());
+    assert_eq!(rows[0].status, kern_core::store::MessageStatus::Delivered);
+    let events = server.store.events_after(0, 1000).unwrap();
+    let delivered = events
+        .iter()
+        .find(|e| e.kind == "agent.message_received")
+        .expect("delivery is in the transcript");
+    assert_eq!(delivered.payload["text"], "also check the logs");
+}

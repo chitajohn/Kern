@@ -224,6 +224,29 @@ impl Client {
         }
     }
 
+    /// `POST /agents/{id}/messages` — queue operator input for a live run.
+    pub async fn send_message(&self, id: &str, text: &str) -> Result<Value, ClientError> {
+        let response = self
+            .send(
+                self.authed(
+                    self.http
+                        .post(format!("{}/agents/{id}/messages", self.base))
+                        .json(&serde_json::json!({ "text": text })),
+                ),
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self.error_from(status, response).await);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Transport(format!("read response: {e}")))?;
+        serde_json::from_slice(&body)
+            .map_err(|e| ClientError::Transport(format!("decode response: {e}")))
+    }
+
     /// `GET /agents/{id}/checkpoints`
     pub async fn list_checkpoints(&self, id: &str) -> Result<Vec<Value>, ClientError> {
         let value = self

@@ -50,7 +50,7 @@ use crate::event::payload::{self, ModelOutcomeKind};
 use crate::event::{EventBus, EventKind};
 use crate::lifecycle::Lifecycle;
 use crate::permissions::{Decision, Effect, FsAction, KeyAction, PermissionEngine};
-use crate::store::model::{Execution, PermissionStatus, ToolCall, ToolCallStatus};
+use crate::store::model::{AgentMessage, Execution, PermissionStatus, ToolCall, ToolCallStatus};
 use crate::store::{ExecutionStatus, LifecycleState, Store};
 use crate::tasks::TaskRegistry;
 use crate::tools::{build_registry, memory_digest};
@@ -224,6 +224,42 @@ impl Engine {
             .checkpoint_now
             .store(true, Ordering::Release);
         true
+    }
+
+    /// Queue an operator message for the agent's live execution
+    /// (ARCHITECTURE §30). The runner consumes it at its next safe point, so
+    /// this never interrupts a model or tool call in flight.
+    ///
+    /// Refused when no runner is live: a queued message with no runner to reach
+    /// it would sit pending forever (or, worse, land on a later run). Callers
+    /// should start a run instead — that path already carries task input.
+    pub async fn message_agent(&self, agent_id: &str, text: &str) -> Result<AgentMessage> {
+        if !self.tasks.is_running(agent_id) {
+            return Err(KernError::new(
+                ErrorCode::InvalidTransition,
+                format!("agent {agent_id} has no live runner; start a run instead"),
+            ));
+        }
+        let execution_id = self.active_execution_id(agent_id).await?.ok_or_else(|| {
+            KernError::new(
+                ErrorCode::InvalidTransition,
+                format!("agent {agent_id} has a live runner but no active execution"),
+            )
+        })?;
+        let store = Arc::clone(&self.store);
+        let agent_owned = agent_id.to_string();
+        let text_owned = text.to_string();
+        let message = store_blocking(store, move |s| {
+            s.enqueue_message(&agent_owned, &execution_id, &text_owned)
+        })
+        .await?;
+        tracing::info!(
+            agent_id,
+            message_id = %message.id,
+            execution_id = %message.execution_id,
+            "operator message queued for a live run"
+        );
+        Ok(message)
     }
 
     /// Request a graceful shutdown: every runner checkpoints and pauses at its
@@ -907,6 +943,28 @@ impl AgentRunner {
             "agent run starting"
         );
         let outcome = self.run_inner().await;
+        // A terminal run has no next safe point: an operator message queued
+        // just before it ended can never be delivered, so it is expired rather
+        // than left looking pending forever (ARCHITECTURE §30). A paused or
+        // sleeping agent keeps its queue — the same execution resumes.
+        if matches!(outcome, Ok(RunOutcome::Completed { .. }) | Err(_)) {
+            let store = Arc::clone(&self.store);
+            let execution_id = self.execution_id.clone();
+            match store_blocking(store, move |s| s.expire_queued_messages(&execution_id)).await {
+                Ok(0) => {}
+                Ok(expired) => tracing::warn!(
+                    agent_id = %self.agent.id,
+                    execution_id = %self.execution_id,
+                    expired,
+                    "operator message(s) expired with the finished execution"
+                ),
+                Err(e) => tracing::warn!(
+                    agent_id = %self.agent.id,
+                    error = %e,
+                    "could not expire undelivered operator messages"
+                ),
+            }
+        }
         match outcome {
             Ok(outcome) => RunSummary {
                 execution_id: self.execution_id.clone(),
@@ -1019,6 +1077,7 @@ impl AgentRunner {
             }
             self.checkpoint_interval_if_due().await?;
             self.check_deadline()?;
+            self.deliver_queued_messages().await?;
             if self.session.steps >= self.spec.runtime.max_steps() as u64 {
                 return Err(KernError::new(
                     ErrorCode::StepLimitExceeded,
@@ -1081,6 +1140,51 @@ impl AgentRunner {
                 }
             }
         }
+    }
+
+    /// Deliver operator messages queued while the run was live
+    /// (ARCHITECTURE §30).
+    ///
+    /// This IS the safe point: the runner is between calls, so appending a
+    /// user message changes nothing the model has already seen. The take is
+    /// atomic (rows flip to `delivered` in the same transaction), a message can
+    /// never be delivered twice, and the checkpoint immediately after makes the
+    /// delivered message part of the durable rollback point — so a crash after
+    /// delivery replays the resume with the message already in the session.
+    async fn deliver_queued_messages(&mut self) -> Result<()> {
+        let store = Arc::clone(&self.store);
+        let execution_id = self.execution_id.clone();
+        let messages =
+            store_blocking(store, move |s| s.take_queued_messages(&execution_id)).await?;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        for message in messages {
+            self.session
+                .messages
+                .push(Message::user(message.text.clone()));
+            self.bus
+                .emit(
+                    EventKind::AgentMessageReceived,
+                    Some(&self.agent.id),
+                    Some(&self.execution_id),
+                    payload::agent_message_received(
+                        &self.agent.id,
+                        &message.id,
+                        self.session.steps,
+                        &message.text,
+                    ),
+                )
+                .await?;
+            tracing::info!(
+                agent_id = %self.agent.id,
+                message_id = %message.id,
+                step = self.session.steps,
+                "operator message delivered to a live session"
+            );
+        }
+        self.checkpoint_now("running", &[]).await?;
+        Ok(())
     }
 
     /// Write a checkpoint of the current session. Increments the per-run

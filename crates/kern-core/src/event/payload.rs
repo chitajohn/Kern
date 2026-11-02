@@ -61,6 +61,16 @@ pub fn agent_thinking(agent_id: &str, step: u64, text: &str) -> Value {
     json!({ "agent_id": agent_id, "step": step, "text": text })
 }
 
+/// An operator message consumed by a live session at a safe point (§30).
+pub fn agent_message_received(agent_id: &str, message_id: &str, step: u64, text: &str) -> Value {
+    json!({
+        "agent_id": agent_id,
+        "message_id": message_id,
+        "step": step,
+        "text": text,
+    })
+}
+
 pub fn agent_waiting(
     agent_id: &str,
     permission_request_id: &str,

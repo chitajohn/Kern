@@ -538,6 +538,112 @@ impl Store {
         })
     }
 
+    // ------------------------------------------------------------------
+    // Mid-run operator messages (schema v5, ARCHITECTURE.md §30)
+    // ------------------------------------------------------------------
+
+    /// Queue an operator message for a live execution. The row is durable, so a
+    /// crash before delivery leaves it queued for the resumed runner.
+    pub fn enqueue_message(
+        &self,
+        agent_id: &str,
+        execution_id: &str,
+        text: &str,
+    ) -> Result<AgentMessage> {
+        self.inject("enqueue_message")?;
+        let message = AgentMessage {
+            id: new_id(),
+            agent_id: agent_id.to_string(),
+            execution_id: execution_id.to_string(),
+            text: text.to_string(),
+            status: MessageStatus::Queued,
+            created_at: Utc::now(),
+            delivered_at: None,
+        };
+        let stored = message.clone();
+        self.with_writer(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_messages
+                   (id, agent_id, execution_id, text, status, created_at, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                params![
+                    stored.id,
+                    stored.agent_id,
+                    stored.execution_id,
+                    stored.text,
+                    stored.status.as_str(),
+                    now_rfc3339(),
+                ],
+            )
+            .map_err(|e| map_sqlite_error(e, "enqueue message"))?;
+            Ok(())
+        })?;
+        Ok(message)
+    }
+
+    /// Take every queued message for an execution, marking it delivered in the
+    /// same transaction: a message can never be handed to the runner twice.
+    pub fn take_queued_messages(&self, execution_id: &str) -> Result<Vec<AgentMessage>> {
+        self.inject("take_queued_messages")?;
+        let ts = now_rfc3339();
+        self.tx(|tx| {
+            let messages = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, agent_id, execution_id, text, status, created_at, delivered_at
+                         FROM agent_messages
+                         WHERE execution_id = ?1 AND status = 'queued'
+                         ORDER BY rowid",
+                    )
+                    .map_err(|e| map_sqlite_error(e, "take messages"))?;
+                let rows = stmt
+                    .query_map(params![execution_id], message_from_row)
+                    .map_err(|e| map_sqlite_error(e, "take messages"))?;
+                collect(rows, "take messages")?
+            };
+            for message in &messages {
+                tx.execute(
+                    "UPDATE agent_messages SET status = 'delivered', delivered_at = ?1
+                     WHERE id = ?2 AND status = 'queued'",
+                    params![ts, message.id],
+                )
+                .map_err(|e| map_sqlite_error(e, "deliver message"))?;
+            }
+            Ok(messages)
+        })
+    }
+
+    /// Mark an execution's undelivered messages `expired` (the execution ended
+    /// before the runner could reach them). Returns how many were expired.
+    pub fn expire_queued_messages(&self, execution_id: &str) -> Result<usize> {
+        self.with_writer(|conn| {
+            conn.execute(
+                "UPDATE agent_messages SET status = 'expired'
+                 WHERE execution_id = ?1 AND status = 'queued'",
+                params![execution_id],
+            )
+            .map_err(|e| map_sqlite_error(e, "expire messages"))
+        })
+    }
+
+    /// Every message queued for an execution, oldest first (status included:
+    /// the API and tests inspect delivery without a private code path).
+    pub fn messages_for_execution(&self, execution_id: &str) -> Result<Vec<AgentMessage>> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, agent_id, execution_id, text, status, created_at, delivered_at
+                     FROM agent_messages WHERE execution_id = ?1
+                     ORDER BY rowid",
+                )
+                .map_err(|e| map_sqlite_error(e, "list messages"))?;
+            let rows = stmt
+                .query_map(params![execution_id], message_from_row)
+                .map_err(|e| map_sqlite_error(e, "list messages"))?;
+            collect(rows, "list messages")
+        })
+    }
+
     /// Set (or clear) the execution's durable wake time (schema v4). Called
     /// when an agent parks for a durable sleep and when it wakes.
     pub fn set_wake_at(&self, execution_id: &str, wake_at: Option<DateTime<Utc>>) -> Result<()> {
@@ -1451,6 +1557,19 @@ fn execution_from_row(row: &Row) -> rusqlite::Result<Execution> {
     })
 }
 
+fn message_from_row(row: &Row) -> rusqlite::Result<AgentMessage> {
+    Ok(AgentMessage {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        execution_id: row.get(2)?,
+        text: row.get(3)?,
+        status: MessageStatus::from_str(&row.get::<_, String>(4)?)
+            .map_err(|e| invalid_enum(4, &e))?,
+        created_at: parse_ts(&row.get::<_, String>(5)?)?,
+        delivered_at: opt_ts_from_row(row.get::<_, Option<String>>(6)?)?,
+    })
+}
+
 fn event_from_row(row: &Row) -> rusqlite::Result<Event> {
     Ok(Event {
         seq: row.get(0)?,
@@ -1592,6 +1711,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn messages_are_taken_once_and_then_expire() {
+        let (_dir, store) = test_store();
+        store
+            .create_agent(&Agent::new("chat", Value::Null, LifecycleState::Created))
+            .unwrap();
+        let agent_id = store.get_agent_by_name("chat").unwrap().unwrap().id;
+        store
+            .create_execution(&Execution::new(&agent_id, ExecutionStatus::Running))
+            .unwrap();
+        let execution_id = store.list_executions_for_agent(&agent_id).unwrap()[0]
+            .id
+            .clone();
+
+        let first = store
+            .enqueue_message(&agent_id, &execution_id, "first")
+            .unwrap();
+        store
+            .enqueue_message(&agent_id, &execution_id, "second")
+            .unwrap();
+
+        let taken = store.take_queued_messages(&execution_id).unwrap();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].text, "first");
+        assert_eq!(taken[1].text, "second");
+
+        // Taken once: the rows are delivered, so a second drain is empty.
+        assert!(store
+            .take_queued_messages(&execution_id)
+            .unwrap()
+            .is_empty());
+        let rows = store.messages_for_execution(&execution_id).unwrap();
+        assert!(rows
+            .iter()
+            .all(|m| m.status == MessageStatus::Delivered && m.delivered_at.is_some()));
+
+        // A message queued after the drain stays queued until it expires.
+        let late = store
+            .enqueue_message(&agent_id, &execution_id, "too late")
+            .unwrap();
+        assert_eq!(store.expire_queued_messages(&execution_id).unwrap(), 1);
+        let rows = store.messages_for_execution(&execution_id).unwrap();
+        let expired = rows.iter().find(|m| m.id == late.id).unwrap();
+        assert_eq!(expired.status, MessageStatus::Expired);
+        assert_eq!(rows[0].id, first.id);
+    }
+
+    #[test]
+    fn v4_database_upgrades_to_v5_preserving_data() {
+        // A v4 database must gain `agent_messages` without losing rows.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(DB_FILE);
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        for m in crate::store::migration::MIGRATIONS
+            .iter()
+            .filter(|m| m.version() <= 4)
+        {
+            let tx = conn.transaction().unwrap();
+            m.up(&tx).unwrap();
+            tx.execute_batch(&format!("PRAGMA user_version = {}", m.version()))
+                .unwrap();
+            tx.execute(
+                "INSERT INTO kern_meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![m.version().to_string()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "INSERT INTO agents (id, name, spec_version, config_json, lifecycle_state, created_at, updated_at, auto_recover)
+             VALUES ('a1', 'legacy', 1, 'null', 'created', ?1, ?1, 1)",
+            params![now_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get_agent("a1").unwrap().name, "legacy");
+        let message = store.enqueue_message("a1", "e1", "hello").unwrap();
+        assert_eq!(message.status, MessageStatus::Queued);
+        assert_eq!(store.messages_for_execution("e1").unwrap().len(), 1);
     }
 
     #[test]
@@ -1756,7 +1959,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 9, "expected the 9 SPEC tables");
+        assert_eq!(table_count, 10, "expected the 10 SPEC tables");
         drop(store);
     }
 
@@ -2218,13 +2421,15 @@ mod tests {
         let _ = std::fs::remove_file(dir.path().join(format!("{DB_FILE}-wal")));
         let _ = std::fs::remove_file(dir.path().join(format!("{DB_FILE}-shm")));
 
-        // Deterministically corrupt page 1's b-tree content (the schema page):
-        // zero a chunk of the sqlite_master b-tree so `quick_check` fails.
-        let mut file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
-        use std::io::{Seek, SeekFrom, Write};
-        file.seek(SeekFrom::Start(512)).unwrap();
-        file.write_all(&[0u8; 64]).unwrap();
-        drop(file);
+        // Deterministically corrupt every page after page 1 (the database
+        // header and the sqlite_master root). Zeroing a fixed window used to
+        // hold only while the schema fit in that window; wiping the rest of the
+        // file destroys cell pages whatever the current schema size is, and a
+        // zeroed page type is never valid, so `quick_check` must fail.
+        let mut bytes = std::fs::read(&db).unwrap();
+        assert!(bytes.len() > 512, "expected the schema to span page 1");
+        bytes[512..].fill(0);
+        std::fs::write(&db, bytes).unwrap();
 
         let err = Store::open(dir.path()).err().expect("open must fail");
         assert_eq!(err.code(), ErrorCode::StorageCorruption);
