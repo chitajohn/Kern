@@ -13,7 +13,9 @@ use async_trait::async_trait;
 
 use crate::error::ModelError;
 use crate::provider::ModelProvider;
-use crate::types::{CompletionRequest, CompletionResponse, FinishReason, ToolCall};
+use crate::types::{
+    Completion, CompletionRequest, CompletionResponse, FinishReason, ToolCall, Usage,
+};
 
 /// One scripted provider response.
 #[derive(Debug, Clone)]
@@ -39,6 +41,9 @@ pub struct MockProvider {
     /// by the shared provider runs the same steps from the start.
     original: Option<Arc<Mutex<VecDeque<ScriptedStep>>>>,
     requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    /// Usage reported for every turn (default: unknown). Tests set this to
+    /// exercise accounting without a live provider.
+    usage: Usage,
 }
 
 impl MockProvider {
@@ -47,7 +52,14 @@ impl MockProvider {
             script: Arc::new(Mutex::new(steps.into_iter().collect())),
             original: None,
             requests: Arc::new(Mutex::new(Vec::new())),
+            usage: Usage::default(),
         }
+    }
+
+    /// Report `usage` on every turn (builder form).
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// A provider that ALWAYS finishes with `text`.
@@ -65,6 +77,7 @@ impl MockProvider {
             script: Arc::new(Mutex::new(steps.clone())),
             original: Some(Arc::new(Mutex::new(steps))),
             requests: Arc::new(Mutex::new(Vec::new())),
+            usage: Usage::default(),
         }
     }
 
@@ -150,6 +163,20 @@ impl ModelProvider for MockProvider {
             }
         }
         Ok(response)
+    }
+
+    async fn complete_counting(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
+        let response = self.complete(req).await?;
+        Ok(Completion::new(response, self.usage))
+    }
+
+    async fn stream_counting(
+        &self,
+        req: &CompletionRequest,
+        deltas: &crate::provider::DeltaSender,
+    ) -> Result<Completion, ModelError> {
+        let response = self.stream(req, deltas).await?;
+        Ok(Completion::new(response, self.usage))
     }
 }
 

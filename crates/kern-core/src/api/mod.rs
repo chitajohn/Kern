@@ -99,6 +99,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/executions/{id}/transcript", get(transcript))
         .route("/tools", get(tools))
         .route("/models", get(models))
+        .route("/usage", get(usage))
+        .route("/events/compact", post(compact_events))
         .route("/permissions/pending", get(pending_permissions))
         .route("/permissions/{id}/grant", post(grant_permission))
         .route("/permissions/{id}/deny", post(deny_permission))
@@ -933,6 +935,7 @@ async fn tools(State(state): State<ApiState>) -> Result<Json<Vec<ToolInfo>>, Api
         state.store.data_dir(),
         Duration::from_secs(30),
         None,
+        Vec::new(),
     ) {
         push(Arc::new(tool), "shell");
     }
@@ -951,6 +954,68 @@ struct ModelInfo {
 /// `GET /models` — registered providers with informational default model
 /// lists and whether the provider is configured via its env key. Model lists
 /// are NOT enumerated from provider APIs in v0.1 (documented limitation).
+/// `POST /events/compact` — prune the durable event log (ARCHITECTURE.md §37).
+///
+/// Keeps the newest `per_agent` events per agent (and every event with no
+/// agent). Compaction is explicit: nothing prunes events on its own schedule,
+/// because the event log is the audit trail.
+async fn compact_events(
+    State(state): State<ApiState>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let per_agent = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("per_agent"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1000);
+    if per_agent == 0 {
+        return Err(ApiError::from_kern(KernError::new(
+            ErrorCode::ConfigInvalid,
+            "per_agent must be positive".to_string(),
+        )));
+    }
+    let per_agent = usize::try_from(per_agent).unwrap_or(usize::MAX);
+    let pruned = state
+        .store
+        .prune_events(per_agent)
+        .map_err(ApiError::from_kern)?;
+    Ok(Json(serde_json::json!({
+        "pruned": pruned,
+        "per_agent": per_agent,
+    })))
+}
+
+/// `GET /usage` — token totals for the whole runtime and per agent
+/// (ARCHITECTURE.md §31).
+async fn usage(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let totals = state
+        .store
+        .usage_totals(None)
+        .map_err(ApiError::from_kern)?;
+    let agents = state.store.list_agents().map_err(ApiError::from_kern)?;
+    let mut per_agent = Vec::with_capacity(agents.len());
+    for agent in agents {
+        let totals = state
+            .store
+            .usage_totals(Some(&agent.id))
+            .map_err(ApiError::from_kern)?;
+        per_agent.push(serde_json::json!({
+            "agent_id": agent.id,
+            "name": agent.name,
+            "input_tokens": totals.input_tokens,
+            "output_tokens": totals.output_tokens,
+            "executions": totals.executions,
+        }));
+    }
+    Ok(Json(serde_json::json!({
+        "input_tokens": totals.input_tokens,
+        "output_tokens": totals.output_tokens,
+        "total_tokens": totals.total(),
+        "executions": totals.executions,
+        "agents": per_agent,
+    })))
+}
+
 async fn models(State(state): State<ApiState>) -> Result<Json<Vec<ModelInfo>>, ApiError> {
     let configured = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
     let infos = state

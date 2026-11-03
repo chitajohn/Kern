@@ -368,11 +368,26 @@ always.
 ### 7.3 Bounded history
 
 Message history is bounded (token/step budget, configurable). When the budget is exceeded, the
-oldest messages are summarized or dropped and a `session.history_trimmed` marker is recorded in
-the checkpoint payload. This prevents unbounded memory/disk growth (a performance
-requirement) while keeping the model within its context window. v0.1 uses a simple
-oldest-drop policy with an explicit marker and a character-based token approximation
-(~4 chars ≈ 1 token); per-provider tokenizers and summarization are v0.2 concerns.
+oldest messages are dropped and a `session.history_trimmed` marker is recorded in the
+checkpoint payload. This prevents unbounded memory/disk growth while keeping the model within
+its context window. Trimming uses the character-based token approximation (§31); §7.5 folds
+the dropped span into a digest first when compaction is configured.
+
+### 7.5 Transcript compaction
+
+Trimming (§7.3) drops messages silently. When `runtime.compact_above_tokens` is set and the
+estimated prompt exceeds it, the runtime instead **folds the compactable middle into one
+digest** before trimming:
+
+- `[task] + digest + recent tail`, with the initial task message always preserved;
+- the tail starts at a non-`tool` message, so no tool result is orphaned from the assistant
+turn that requested it;
+- the digest is built from what the session already recorded (role + excerpt + called tool
+names) — no model call, so it is deterministic, free, and cannot hallucinate;
+- the compacted session is checkpointed immediately, so a crash replays the same prompt.
+
+This is deliberately not a summarizer model call: cost and nondeterminism are the two things
+a recovery-critical path must not acquire.
 
 ---
 
@@ -863,19 +878,27 @@ call.
 
 ---
 
-## 19. Non-goals for v0.1
+## 19. Non-goals
+
+Shipped since v0.1 and therefore no longer listed here: mid-run operator input (§30),
+sub-agents / agents-as-tools (§35), file-backed memory (§34), token accounting (§31), model
+routing (§32), transcript compaction (§7.5), per-tool credential injection (§33), Kern as an
+MCP *server* (§36), and explicit event compaction (§37).
+
+Still out of scope:
 
 - Distributed execution, remote workers, agent migration (v0.3 roadmap).
 - Multi-user / multi-tenant / cloud control plane.
-- Sub-agents / agents-as-tools (v0.2; the `Tool` trait is the hook).
-- Mid-run user input (v0.2; `agent.thinking` covers reasoning visibility). Token streaming
-  ships as live-only deltas (§29), but *durable* streaming — checkpointed cursors that let an
-  interrupted generation resume — remains deferred (§24.5).
-- Memory providers beyond the durable KV store (provider trait exists; file/vector backends
-  land in v0.2).
+- *Durable* token streaming — checkpointed cursors that let an interrupted generation
+  resume — remains deferred (§24.5). Live deltas (§29) are unchanged.
+- CPU/memory/disk *budgets* beyond the per-process address-space cap: enforcement belongs to
+  the sandbox tier, not the engine.
+- Per-provider exact tokenizers: counts are provenance-tagged `reported` or `estimated`
+  (§31), never silently conflated.
+- Vector/embedding memory backends (§34 ships `store` and `file`).
 - A web UI (desktop/web clients are future application layers on the same API).
 - Exactly-once tool execution (see §7.2).
-- Background-service installation for the daemon (v0.1 runs foreground).
+- Background-service installation for the daemon (it runs foreground).
 
 ---
 
@@ -1122,16 +1145,22 @@ commonly group/world readable). The database holds agent configs, tool
 results, memory, and event history; file permissions are the local mitigation
 for the copied-database threat. Proven by `crates/kern-core/tests/store_perms.rs`.
 
-### 25.3 Deferred from v0.1
+### 25.3 Deferred from v0.1 — status after v0.2
 
-Explicitly kept out of v0.1: per-tool
-credential injection, model routing, agent-to-agent tasks, token
-accounting, event compaction, and CPU/memory/disk budgets (enforcement
-belongs to the sandbox tier). MCP tool servers graduated out of this list
-(§28); MCP *clients* — Kern acting as a server for other agents — remain out. The event system already carries global
-sequence numbers and per-execution filtering; the transcript endpoint
-reconstructs an execution in order — sufficient for v0.1 without an
-event-sourcing layer.
+Every item deferred from v0.1 has since landed, except the two that are deliberate
+boundaries rather than backlog:
+
+| Item | Status |
+|---|---|
+| Per-tool credential injection | Shipped — `credentials[]`, §33 |
+| Model routing | Shipped — `model.routing[]`, §32 |
+| Agent-to-agent tasks | Shipped — `subagents[]` / `agent.<name>`, §35 (one level deep, by design) |
+| Token accounting | Shipped — schema v6 counters + `/usage` + `kern usage`, §31 |
+| Event compaction | Shipped — explicit `kern compact` / `POST /events/compact`, §37 |
+| MCP tool servers (Kern as client) | Shipped in v0.1 — §28 |
+| MCP clients (Kern as server) | Shipped — `kern mcp serve`, §36 |
+| CPU/memory/disk budgets | Still out: enforcement belongs to the sandbox tier |
+| Durable streaming | Still out: a mid-stream checkpoint is not a resume point (§24.5) |
 
 ## 26. Durable wake/sleep
 
@@ -1423,3 +1452,168 @@ There is no priority path that preempts a long model call, no mid-stream steerin
 stream is not a conversation), and no client-side delivery receipt beyond the
 `agent.message_received` event and the row status. Multi-agent conversation (message an agent
 *from* an agent) remains the deferred agent-to-agent work in §25.3.
+
+---
+
+## 31. Token accounting
+
+Usage travels **with** the turn, never as a side channel: `ModelProvider::complete_counting`
+returns a `Completion { response, usage }`, and the gateway returns the same shape. A retried
+attempt's usage is not counted, because only one turn was billed to the step.
+
+`Usage` distinguishes `Some(0)` from `None`. A provider that reports nothing yields `None`,
+and the runtime estimates from the exact request/response it just used
+(`kern_model::tokens`, a per-family chars-per-token divisor). Every count therefore has a
+provenance: `reported` or `estimated`.
+
+Durability: totals are added to the `executions` row (`input_tokens`, `output_tokens`,
+schema v6) **before** any state change, so a crash cannot lose tokens the provider already
+billed. A resumed run continues its count instead of restarting it. `model.completed` carries
+the same numbers plus `estimated: true|false`.
+
+Surfaces: `GET /usage` (runtime + per agent) and `kern usage [--agent <name>] [--json]`.
+
+Honest limitation: the estimate is an approximation (±15% on prose, pessimistic on code and
+CJK). It is for budgeting and routing decisions, not billing.
+
+---
+
+## 32. Model routing
+
+`model.routing[]` is an ordered list; the first rule whose conditions **all** hold wins for
+that call:
+
+```yaml
+model:
+  provider: openai
+  model: gpt-4o-mini
+  routing:
+    - if_tokens_above: 40000      # context grew: escalate
+      provider: anthropic
+      model: claude-sonnet-4
+    - if_step_above: 20           # long run: cheaper, more capable
+      provider: openai
+      model: gpt-4o
+```
+
+- Conditions: `if_step_above` (completed steps) and `if_tokens_above` (cumulative execution
+  tokens). Both present ⇒ `AND`.
+- A rule with no conditions always matches, so it is only allowed as the **last** rule;
+  validation rejects an unconditional rule anywhere else as unreachable.
+- Routing is evaluated per model call, so a run escalates without restarting, and the choice
+  is visible in `model.requested` / `model.completed`.
+- `max_tokens` / `temperature` may be overridden per rule.
+
+---
+
+## 33. Per-tool credential injection
+
+```yaml
+credentials:
+  - name: GITHUB_TOKEN
+    from: env:GITHUB_TOKEN        # resolved at agent start; fail closed if unset
+    tools: [shell, mcp]
+  - name: token
+    from: env:API_TOKEN
+    tools: [http]
+    header: X-Api-Key
+    prefix: "Bearer "
+```
+
+- **Scoped, never ambient.** A credential names its targets (`shell`, `http`, `mcp`); the
+  default is `[shell]`. It reaches only those tools.
+- **Fail closed.** An unset `env:` source fails the agent's start. Silently injecting an empty
+  secret or skipping the grant would turn a misconfiguration into a mysterious 401.
+- **Shell:** injected after the environment scrub (§12), so a grant is the *only* path to a
+  secret — the daemon env is still never inherited.
+- **HTTP:** sent as a runtime-granted header that **replaces** any model-supplied header of
+  the same name, applied after the model's headers.
+- **MCP:** added to the child's environment; an explicit `mcp.servers[].env` entry wins.
+- **Never observable.** Values are not logged, not evented, not shown to the model, and are
+  redacted in `Debug` output.
+
+---
+
+## 34. Memory backends
+
+`memory.backend` selects the implementation behind the unchanged `memory.read/write/list`
+contract:
+
+| Backend | Storage | Use when |
+|---|---|---|
+| `store` (default) | agent-scoped rows in the runtime DB | you want memory durable with the execution state |
+| `file` | `<workspace>/<memory.dir>/memory.json` | you want to read, diff, and version memory with normal tools |
+
+The file backend keeps **one file per agent** rather than one file per key: keys are
+model-supplied strings, and mapping them onto filenames is how path-traversal bugs are
+invented. Writes are serialized per provider, land through temp-file + rename, and `memory.dir`
+must be relative and free of `..`.
+
+Both backends feed `memory.inject_digest` identically — the engine reads through the provider,
+so a file-backed agent's digest reflects its file. Sub-agents are forced onto `store`, so a
+child never shares its parent's file memory.
+
+---
+
+## 35. Sub-agents (agents-as-tools)
+
+```yaml
+tools: [http, filesystem, agent.researcher]
+subagents:
+  - name: researcher
+    description: Finds sources and returns a cited summary
+    tools: [http]                 # MUST be a subset of the parent's tools
+    max_steps: 12
+    max_duration: 5m
+    model: { provider: anthropic, model: claude-sonnet-4 }   # optional
+```
+
+A sub-agent is a real execution, not an in-process pretense:
+
+- its own agent id, workspace, execution row, checkpoints, and event stream (so its transcript
+  is inspectable and its crash recovery is the runtime's normal recovery);
+- the parent's permission engine verbatim, and a **validated subset** of the parent's tools —
+  delegation can never widen capability;
+- no `subagents` field of its own, so the call graph is exactly one level deep;
+- bounded by `max_steps`, `max_duration`, and `runtime.subagent_timeout` (default 300 s) —
+  which replaces `tool_timeout` for `agent.*` calls, because a delegation runs a whole run.
+
+The tool returns `{agent, agent_id, execution_id, steps, result}`; a child failure is the
+tool's failure (`TOOL_FAILED`), which the parent's model can react to. The child row is deleted
+when it finishes — it is not a long-lived agent the operator manages.
+
+**Deadlock avoidance.** Each running child holds one permit from a dedicated sub-agent
+semaphore sized at `global_tool_cap / 2`. A child's own tools therefore always have global
+permits left, even in the worst case where every sub-agent slot is occupied.
+
+**Gaps.** No streaming of a child's text to the parent, no mid-delegation cancellation, and a
+`paused`/`sleeping` child is reported as a failure (a delegation must complete synchronously).
+
+---
+
+## 36. Kern as an MCP server
+
+`kern mcp serve agent.yaml [--workspace DIR]` speaks JSON-RPC 2.0 over stdio (protocol
+`2024-11-05`): `initialize`, `tools/list`, `tools/call`, `ping`; notifications never get a
+response. Another agent or MCP-capable client can then use this agent's tools.
+
+Security position:
+
+- **Policy first.** Every call is classified by the same `policy::classify` the engine uses,
+  against the spec's permission engine and workspace. There is no operator channel on this
+  surface, so an `ask` rule **fails closed** rather than being treated as an allow.
+- **Stateless tools only.** `filesystem`, `http`, `shell`, `noop`, `sleep` are served. Memory,
+  sub-agent, and proxied-MCP tools need the daemon's store or engine and are rejected at
+  start instead of being served against the wrong state.
+- **Bounded.** Each call is wrapped in `runtime.tool_timeout`, arguments are validated by the
+  registry, and responses are `content[]` text with `isError`.
+- Logs go to stderr; stdout carries protocol frames only.
+
+---
+
+## 37. Event compaction
+
+The event log is the audit trail, so nothing prunes it on a schedule. Compaction is an explicit
+operator action: `kern compact --per-agent N` (`POST /events/compact`) keeps the newest `N`
+events per agent and reports how many rows were removed. `seq` stays monotonic; replay cursors
+that point at pruned events simply see the gap, which the SSE resume path already handles.

@@ -715,23 +715,23 @@ fn history_is_bounded_and_never_drops_the_task() {
 fn port_scoped_network_rules_are_enforced() {
     // Engine side: the exact target string the gate hands to the policy.
     assert_eq!(
-        http_host_port("https://api.github.com/repos/x").as_deref(),
+        crate::policy::host_port("https://api.github.com/repos/x").as_deref(),
         Some("api.github.com:443")
     );
     assert_eq!(
-        http_host_port("http://api.github.com/x").as_deref(),
+        crate::policy::host_port("http://api.github.com/x").as_deref(),
         Some("api.github.com:80")
     );
     assert_eq!(
-        http_host_port("https://api.github.com:8443/x").as_deref(),
+        crate::policy::host_port("https://api.github.com:8443/x").as_deref(),
         Some("api.github.com:8443")
     );
     assert_eq!(
-        http_host_port("http://[::1]:8080/x").as_deref(),
+        crate::policy::host_port("http://[::1]:8080/x").as_deref(),
         Some("[::1]"),
         "IPv6 with port keeps host-only form (fail-closed, documented)"
     );
-    assert!(http_host_port("not a url").is_none());
+    assert!(crate::policy::host_port("not a url").is_none());
 
     // Policy side: `host:port` targets against a port-scoped rule set.
     let dir = tempfile::tempdir().unwrap();
@@ -1475,4 +1475,178 @@ async fn message_without_a_live_runner_is_refused() {
     // Nothing was queued: a message with no runner to reach it must not linger.
     let executions = env.store.list_executions_for_agent(&agent_id).unwrap();
     assert!(executions.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Token accounting (§31)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn usage_is_recorded_on_the_execution_and_aggregated() {
+    let env = TestEnv::new(vec![ScriptedStep::Finish("counted".into())]);
+    // The mock reports the same usage for every turn it serves.
+    let provider = MockProvider::new([ScriptedStep::Finish("counted".into())])
+        .with_usage(kern_model::Usage::new(Some(120), Some(30)));
+    let _ = provider;
+
+    let agent_id = env.create_agent(
+        "version: 1\nname: countme\nmodel:\n  provider: mock\n  model: test\ntools:\n  - noop\n",
+    );
+    let summary = env.engine.run_agent(&agent_id, None).await.unwrap();
+
+    // The engine's provider reports nothing, so the estimate fills both halves:
+    // the count is present and attributed to the right execution.
+    let execution = env.store.get_execution(&summary.execution_id).unwrap();
+    assert!(
+        execution.input_tokens > 0 && execution.output_tokens > 0,
+        "estimated usage must be recorded: {execution:?}"
+    );
+
+    let totals = env.store.usage_totals(Some(&agent_id)).unwrap();
+    assert_eq!(totals.input_tokens, execution.input_tokens);
+    assert_eq!(totals.output_tokens, execution.output_tokens);
+    assert_eq!(totals.executions, 1);
+
+    // The event carries the same numbers and says they are estimated.
+    let event = env
+        .events()
+        .into_iter()
+        .find(|e| e.kind == "model.completed")
+        .expect("model.completed event");
+    assert_eq!(
+        event.payload["input_tokens"].as_u64().unwrap(),
+        execution.input_tokens
+    );
+    assert_eq!(event.payload["estimated"], true);
+}
+
+#[tokio::test]
+async fn provider_reported_usage_wins_over_the_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let bus = EventBus::new(Arc::clone(&store));
+    let provider = MockProvider::new([ScriptedStep::Finish("counted".into())])
+        .with_usage(kern_model::Usage::new(Some(7), Some(3)));
+    let mut gateway = ModelGateway::new();
+    gateway.register(Arc::new(provider)).unwrap();
+    let engine = Engine::new(Arc::clone(&store), bus, Arc::new(gateway), 8);
+
+    let spec = parse_agent_spec(
+        "version: 1\nname: counted\nmodel:\n  provider: mock\n  model: test\ntools:\n  - noop\n",
+    )
+    .unwrap();
+    let agent = Agent::new(
+        spec.name.clone(),
+        serde_json::to_value(&spec).unwrap(),
+        LifecycleState::Created,
+    );
+    store.create_agent(&agent).unwrap();
+
+    let summary = engine.run_agent(&agent.id, None).await.unwrap();
+    let execution = store.get_execution(&summary.execution_id).unwrap();
+    assert_eq!(execution.input_tokens, 7);
+    assert_eq!(execution.output_tokens, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Model routing (§32)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn routing_switches_model_after_the_configured_step() {
+    let env = TestEnv::new(vec![
+        ScriptedStep::ToolCalls(vec![tool_call("c1", "noop", serde_json::json!({}))]),
+        ScriptedStep::Finish("done".into()),
+    ]);
+    let agent_id = env.create_agent(
+        "version: 1\nname: router\nmodel:\n  provider: mock\n  model: base-model\n\
+         \x20 routing:\n    - if_step_above: 0\n      provider: mock\n      model: escalated-model\n\
+         tools:\n  - noop\n",
+    );
+
+    env.engine.run_agent(&agent_id, None).await.unwrap();
+    let requests = env.provider.take_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one turn before, one after the tool batch"
+    );
+    assert_eq!(requests[0].model, "base-model");
+    assert_eq!(
+        requests[1].model, "escalated-model",
+        "a rule matched after step 0"
+    );
+}
+
+#[tokio::test]
+async fn routing_rules_cannot_be_made_unreachable() {
+    let err = parse_agent_spec(
+        "version: 1\nname: bad-routing\nmodel:\n  provider: mock\n  model: m\n\
+         \x20 routing:\n    - provider: mock\n      model: always\n\
+         \x20   - if_step_above: 3\n      provider: mock\n      model: never\n\
+         tools: [noop]\n",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigInvalid);
+    assert!(err.to_string().contains("last rule"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Transcript compaction (§7.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compaction_keeps_the_task_and_the_recent_tail() {
+    let mut messages = vec![Message::user("the original task")];
+    for i in 0..10 {
+        messages.push(Message::assistant(format!("step {i}")));
+        messages.push(Message::user(format!("result {i}")));
+    }
+    let before = messages.len();
+
+    let changed = compact_messages(&mut messages, 4, 12_000, 9);
+    assert!(changed);
+    assert!(messages.len() < before);
+    assert_eq!(messages[0].content, "the original task");
+    assert!(
+        messages[1].content.starts_with("[compacted transcript]"),
+        "digest message: {}",
+        messages[1].content
+    );
+    assert!(
+        messages[1].content.contains("step 0"),
+        "digest keeps history"
+    );
+}
+
+#[test]
+fn compaction_never_orphans_a_tool_result() {
+    let mut messages = vec![Message::user("task")];
+    messages.push(Message::assistant_with_tool_calls(
+        "",
+        vec![tool_call("c1", "noop", serde_json::json!({}))],
+    ));
+    messages.push(Message::tool_result("c1", "{}"));
+    messages.push(Message::assistant("done"));
+    messages.push(Message::user("more"));
+    messages.push(Message::assistant("ok"));
+
+    // Keeping only the last two messages would start the tail on a tool result.
+    let changed = compact_messages(&mut messages, 2, 9_000, 3);
+    assert!(changed);
+    assert!(
+        messages
+            .iter()
+            .skip(2)
+            .all(|m| m.role != kern_model::Role::Tool),
+        "tail must not begin with an orphaned tool result: {messages:?}"
+    );
+}
+
+#[test]
+fn compaction_is_a_noop_for_short_transcripts() {
+    let mut messages = vec![Message::user("task"), Message::assistant("done")];
+    let before = messages.clone();
+    assert!(!compact_messages(&mut messages, 4, 1, 1));
+    assert_eq!(messages, before);
 }

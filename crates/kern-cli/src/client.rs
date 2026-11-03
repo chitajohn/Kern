@@ -296,6 +296,24 @@ impl Client {
             .map_err(|e| ClientError::Transport(format!("decode models: {e}")))
     }
 
+    /// `POST /events/compact`
+    pub async fn compact_events(&self, per_agent: usize) -> Result<Value, ClientError> {
+        self.json_response(
+            self.authed(
+                self.http
+                    .post(format!("{}/events/compact", self.base))
+                    .json(&serde_json::json!({ "per_agent": per_agent })),
+            ),
+        )
+        .await
+    }
+
+    /// `GET /usage`
+    pub async fn usage(&self) -> Result<Value, ClientError> {
+        self.json_response(self.authed(self.http.get(format!("{}/usage", self.base))))
+            .await
+    }
+
     /// `GET /permissions/pending`
     pub async fn pending_permissions(&self) -> Result<Vec<Value>, ClientError> {
         let value = self

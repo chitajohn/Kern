@@ -317,6 +317,9 @@ CREATE INDEX ix_agent_messages_pending
 - Checkpoint retention: on checkpoint create, older checkpoints beyond
   `runtime.checkpoint_retention` (default 50) per agent are pruned in the same transaction
   (the latest is never pruned).
+- Schema v6 adds `executions.input_tokens` / `executions.output_tokens` (`INTEGER NOT NULL
+  DEFAULT 0`) for token accounting. Counters are incremented per model turn before any state
+  change, so a crash cannot lose tokens the provider already billed.
 
 ---
 
@@ -513,6 +516,8 @@ memory:
   inject_digest: false         # optional; prepend memory digest to system prompt each step
   max_keys: 100                # optional; per-agent key cap
   max_value_bytes: 65536       # optional; per-key value cap
+  backend: store               # optional: store | file (ARCHITECTURE.md §34)
+  dir: .kern/memory            # optional, file backend only; relative to the workspace
 
 permissions:                  # optional; absence of a class = no access (default deny)
   filesystem:                  # optional; absence = no filesystem access
@@ -568,7 +573,46 @@ runtime:
                                # run inside the runner
   stream: false                # optional, default false; broadcast live model text
                                # as transient `model.delta` events (never persisted, §6)
+  compact_above_tokens: 48000  # optional; fold older turns into a digest above this size
+  compact_keep_recent: 6       # optional, default 6; messages kept verbatim
+  subagent_timeout: 300s       # optional, default 300s; budget for one `agent.*` call
 ```
+
+### 9.1 Delegation, routing, and credentials (schema v1, additive)
+
+```yaml
+model:
+  routing:                     # ordered; first match wins, evaluated per model call (§32)
+    - if_tokens_above: 40000
+      provider: anthropic
+      model: claude-sonnet-4
+    - if_step_above: 20
+      provider: openai
+      model: gpt-4o
+
+subagents:                     # agents-as-tools: `agent.<name>` in `tools` (§35)
+  - name: researcher
+    description: Finds sources and returns a cited summary
+    tools: [http]              # MUST be a subset of the parent's `tools`
+    max_steps: 12
+    max_duration: 5m
+    model: { provider: anthropic, model: claude-sonnet-4 }   # optional
+
+credentials:                   # per-tool secret injection (§33)
+  - name: GITHUB_TOKEN
+    from: env:GITHUB_TOKEN     # resolved at agent start; missing ⇒ CONFIG_INVALID
+    tools: [shell, mcp]        # default [shell]
+  - name: token
+    from: env:API_TOKEN
+    tools: [http]
+    header: X-Api-Key
+    prefix: "Bearer "
+```
+
+Rules: a sub-agent cannot declare sub-agents (nesting is rejected), cannot name a tool its
+parent lacks, and is rejected if `agent.<name>` is listed without a matching `subagents[]`
+entry. A routing rule with no conditions must be last. A credential's `header`/`prefix` require
+the `http` target, and env-style targets require an uppercase variable name.
 
 **Rules**
 
@@ -879,6 +923,9 @@ data: {…}
 | `kern pause\|resume\|checkpoint\|terminate <name\|id>` | lifecycle control |
 | `kern message <name\|id> "text"` | send a running agent a message; delivered at its next safe point (§30) |
 | `kern tools` / `kern models` | capability discovery |
+| `kern usage [--agent <name\|id>] [--json]` | token totals per agent and runtime-wide (§31) |
+| `kern compact [--per-agent N]` | prune the event log, keeping the newest N events per agent (§37) |
+| `kern mcp serve agent.yaml [--workspace DIR]` | serve the spec's stateless tools over MCP stdio (§36) |
 | `kern version` | version + API address |
 
 Exit codes: `0` success, `1` runtime/client error, `2` usage error.

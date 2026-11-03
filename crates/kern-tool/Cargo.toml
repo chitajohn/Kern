@@ -21,7 +21,7 @@ async-trait = { workspace = true }
 jsonschema = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
-kern-model = { version = "0.1.0", path = "../kern-model" }
+kern-model = { version = "0.2.0", path = "../kern-model" }
 tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 
 use crate::error::{from_status, ModelError};
 use crate::provider::ModelProvider;
-use crate::types::{CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall};
+use crate::types::{
+    Completion, CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall, Usage,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Guard against unbounded provider responses.
@@ -36,15 +38,10 @@ impl OpenAiProvider {
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self::new(base_url, std::env::var("OPENAI_API_KEY").ok())
     }
-}
 
-#[async_trait]
-impl ModelProvider for OpenAiProvider {
-    fn id(&self) -> &str {
-        "openai"
-    }
-
-    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+    /// One Chat Completions call, carrying the provider's usage block when it
+    /// sends one (`prompt_tokens`/`completion_tokens`).
+    async fn fetch_completion(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
         let key = self
             .api_key
             .as_deref()
@@ -76,7 +73,22 @@ impl ModelProvider for OpenAiProvider {
             ModelError::InvalidResponse(format!("openai response is not JSON: {e}"))
         })?;
 
-        normalize(&payload)
+        Ok(Completion::new(normalize(&payload)?, usage_from(&payload)))
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenAiProvider {
+    fn id(&self) -> &str {
+        "openai"
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        Ok(self.fetch_completion(req).await?.response)
+    }
+
+    async fn complete_counting(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
+        self.fetch_completion(req).await
     }
 
     /// Stream the Chat Completions SSE stream (`stream: true`).
@@ -337,6 +349,26 @@ fn openai_message(msg: &Message) -> Value {
             "content": msg.content,
         }),
     }
+}
+
+/// The provider's usage block, when present. OpenAI reports `prompt_tokens`
+/// (older) or `input_tokens` (Responses-style compat gateways).
+fn usage_from(payload: &Value) -> Usage {
+    let Some(usage) = payload.get("usage") else {
+        return Usage::default();
+    };
+    let input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("input_tokens").and_then(Value::as_u64));
+    let output = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("output_tokens").and_then(Value::as_u64));
+    Usage::new(
+        input.map(|v| v.min(u64::from(u32::MAX)) as u32),
+        output.map(|v| v.min(u64::from(u32::MAX)) as u32),
+    )
 }
 
 /// Normalize a Chat Completions response payload.

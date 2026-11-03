@@ -16,6 +16,7 @@ pub mod ollama;
 pub mod openai;
 pub mod provider;
 pub mod stream;
+pub mod tokens;
 pub mod types;
 
 pub use error::ModelError;
@@ -23,5 +24,6 @@ pub use gateway::{ModelGateway, DEFAULT_RETRIES, DEFAULT_TIMEOUT};
 pub use mock::{MockProvider, ScriptedStep};
 pub use provider::{delta_channel, emit_delta, DeltaSender, ModelProvider};
 pub use types::{
-    CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall, ToolSpec, Usage,
+    Completion, CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall,
+    ToolSpec, Usage,
 };

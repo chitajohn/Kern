@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use crate::error::{from_status, ModelError};
 use crate::provider::ModelProvider;
 use crate::stream::LineReader;
-use crate::types::{CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall};
+use crate::types::{
+    Completion, CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall, Usage,
+};
 
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 /// Guard against unbounded provider responses.
@@ -58,15 +60,9 @@ impl OllamaProvider {
         }
         Ok(response)
     }
-}
 
-#[async_trait]
-impl ModelProvider for OllamaProvider {
-    fn id(&self) -> &str {
-        "ollama"
-    }
-
-    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+    /// One `/api/chat` call, carrying `prompt_eval_count`/`eval_count`.
+    async fn fetch_completion(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
         let response = self.post(&build_body(req)).await?;
         if let Some(len) = response.content_length() {
             if len > MAX_RESPONSE_BYTES {
@@ -79,7 +75,22 @@ impl ModelProvider for OllamaProvider {
             ModelError::InvalidResponse(format!("ollama response is not JSON: {e}"))
         })?;
 
-        normalize(&payload)
+        Ok(Completion::new(normalize(&payload)?, usage_from(&payload)))
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OllamaProvider {
+    fn id(&self) -> &str {
+        "ollama"
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        Ok(self.fetch_completion(req).await?.response)
+    }
+
+    async fn complete_counting(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
+        self.fetch_completion(req).await
     }
 
     /// Stream `/api/chat` (`stream: true`), which is newline-delimited JSON:
@@ -253,6 +264,18 @@ fn ollama_message(msg: &Message) -> Value {
             m
         }
     }
+}
+
+/// The provider's usage counters, when the server reports them. Ollama counts
+/// prompt and generated tokens separately (`prompt_eval_count`/`eval_count`).
+fn usage_from(payload: &Value) -> Usage {
+    let count = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+    };
+    Usage::new(count("prompt_eval_count"), count("eval_count"))
 }
 
 /// Normalize an Ollama chat response payload.

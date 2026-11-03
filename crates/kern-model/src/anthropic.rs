@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use crate::error::{from_status, ModelError};
 use crate::provider::ModelProvider;
 use crate::stream::LineReader;
-use crate::types::{CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall};
+use crate::types::{
+    Completion, CompletionRequest, CompletionResponse, FinishReason, Message, Role, ToolCall, Usage,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// The API requires `max_tokens`; this is the fallback when a request omits it.
@@ -75,15 +77,9 @@ impl AnthropicProvider {
         }
         Ok(response)
     }
-}
 
-#[async_trait]
-impl ModelProvider for AnthropicProvider {
-    fn id(&self) -> &str {
-        "anthropic"
-    }
-
-    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+    /// One Messages call, carrying the provider's usage block when present.
+    async fn fetch_completion(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
         let response = self.post(&build_body(req)).await?;
         if let Some(len) = response.content_length() {
             if len > MAX_RESPONSE_BYTES {
@@ -96,7 +92,22 @@ impl ModelProvider for AnthropicProvider {
             ModelError::InvalidResponse(format!("anthropic response is not JSON: {e}"))
         })?;
 
-        normalize(&payload)
+        Ok(Completion::new(normalize(&payload)?, usage_from(&payload)))
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicProvider {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+
+    async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError> {
+        Ok(self.fetch_completion(req).await?.response)
+    }
+
+    async fn complete_counting(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
+        self.fetch_completion(req).await
     }
 
     /// Stream the Messages API SSE stream (`stream: true`).
@@ -368,6 +379,20 @@ fn anthropic_message(msg: &Message) -> Value {
         }),
         Role::System => unreachable!("system messages are extracted into the top-level field"),
     }
+}
+
+/// The provider's usage block (`input_tokens`/`output_tokens`), when present.
+fn usage_from(payload: &Value) -> Usage {
+    let Some(usage) = payload.get("usage") else {
+        return Usage::default();
+    };
+    let count = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+    };
+    Usage::new(count("input_tokens"), count("output_tokens"))
 }
 
 /// Normalize a Messages API response payload.

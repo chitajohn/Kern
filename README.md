@@ -3,7 +3,7 @@
 **The open-source runtime for reliable, long-running AI agents.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.2.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
   <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status">
 </p>
@@ -30,6 +30,18 @@ checkpoint instead of starting over.
 - **Observability** -- Every meaningful action is a structured, persisted event, queryable via the API and `kern logs`, streamed over SSE. With `runtime.stream: true`, model text also streams live as transient `model.delta` events (never persisted — the turn is still recorded from the final response). Every builtin adapter streams its native protocol (OpenAI SSE, Anthropic Messages SSE, Ollama NDJSON).
 
 - **Live steering** -- A running agent is addressable, not just observable: `kern message <agent> "..."` queues input that the runner appends at its next safe point, so you can correct course mid-run without pausing, terminating, or interrupting the call in flight. Messages are durable and delivered exactly once.
+
+- **Sub-agents** -- Declare `subagents[]` and the model gets an `agent.<name>` tool. A delegation runs a real child execution (own workspace, checkpoints, events) with a validated subset of the parent's tools, so it can never exceed what the parent may do.
+
+- **Token accounting** -- Every model turn's usage is recorded with provenance (`reported` by the provider, or a documented estimate) and persisted per execution. `kern usage` shows per-agent and runtime-wide totals.
+
+- **Model routing** -- Escalate or switch models mid-run: `model.routing[]` rules match on step count or cumulative tokens, evaluated on every call.
+
+- **Context compaction** -- When the transcript grows past `runtime.compact_above_tokens`, older turns fold into a deterministic digest instead of being silently dropped. No extra model call, no hallucinated summary.
+
+- **Scoped credentials** -- `credentials[]` injects secrets into exactly the tools you name (`shell`, `http`, `mcp`) and nowhere else. Values are never logged, evented, or shown to the model.
+
+- **Kern as an MCP server** -- `kern mcp serve agent.yaml` exposes an agent's stateless tools over MCP stdio, under the same permission policy the runtime enforces.
 
 - **Scheduling** -- Agents can run on an interval or cron schedule with crash-safe scheduling state.
 
@@ -159,6 +171,9 @@ The CLI is a control interface to the runtime, not the runtime itself. It talks 
 | `kern permissions` / `grant` / `deny` | Resolve `waiting` agents' `ask` requests |
 | `kern schedule <agent>` | Show next scheduled runs |
 | `kern tools` / `kern models` | Runtime capability inventory |
+| `kern usage [--agent <agent>] [--json]` | Token totals per agent and runtime-wide |
+| `kern compact [--per-agent N]` | Prune the event log, keeping the newest N events per agent |
+| `kern mcp serve agent.yaml` | Serve an agent's stateless tools over MCP (stdio) |
 | `kern doctor` | Environment health: DB integrity, provider keys, sandbox backend |
 | `kern version` | Version, schema version, sandbox backend |
 
