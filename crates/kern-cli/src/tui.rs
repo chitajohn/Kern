@@ -244,7 +244,10 @@ enum AppMsg {
     Permissions(Vec<Value>),
     Usage(Value),
     Tools(Vec<Value>),
+    Stream(Value),
+    StreamClosed(bool),
     ActionDone(String),
+    Failed(String),
     Error(String),
 }
 
@@ -273,6 +276,9 @@ struct App {
     help: bool,
     fetching: bool,
     quit: bool,
+    stream_live: bool,
+    new_agent_input: Option<String>,
+    pending_create: Option<String>,
     daemon: String,
 }
 
@@ -302,6 +308,9 @@ impl App {
             help: false,
             fetching: false,
             quit: false,
+            stream_live: false,
+            new_agent_input: None,
+            pending_create: None,
             daemon,
         }
     }
@@ -367,6 +376,48 @@ impl App {
         self.selected = index.min(len.saturating_sub(1));
     }
 
+    /// Append one event when it belongs to the selected agent and is not
+    /// already covered by the transcript.
+    ///
+    /// Stream frames and poll backfills overlap by design (the stream replays,
+    /// the poller fills gaps), so durable events are deduped by `seq`. Transient
+    /// `model.delta` frames carry `seq == 0` and are always kept.
+    fn ingest(&mut self, event: Value) {
+        if let (Some(event_agent), Some(selected)) =
+            (event["agent_id"].as_str(), self.selected_id().as_deref())
+        {
+            if event_agent != selected {
+                return;
+            }
+        }
+        let seq = event["seq"].as_i64().unwrap_or(0);
+        if seq > 0 {
+            if seq <= self.event_cursor {
+                return;
+            }
+            self.event_cursor = seq;
+        }
+        self.events.push(event);
+        // Bound the in-memory transcript: the TUI is a window, not an archive.
+        const MAX_EVENTS: usize = 5_000;
+        if self.events.len() > MAX_EVENTS {
+            let drop = self.events.len() - MAX_EVENTS;
+            self.events.drain(..drop);
+        }
+        if self.follow {
+            self.event_scroll = u16::MAX;
+        }
+    }
+
+    /// Drop the transcript of the previously selected agent.
+    fn reset_transcript(&mut self) {
+        self.events.clear();
+        self.event_cursor = 0;
+        self.event_scroll = 0;
+        self.detail = None;
+        self.detail_for = None;
+    }
+
     /// Apply one message from the network or keyboard.
     fn apply(&mut self, msg: AppMsg) -> Option<Action> {
         match msg {
@@ -391,18 +442,8 @@ impl App {
                 if self.selected_id().as_deref() != Some(agent_id.as_str()) {
                     return None;
                 }
-                if let Some(last) = events.iter().filter_map(|e| e["seq"].as_i64()).max() {
-                    self.event_cursor = self.event_cursor.max(last);
-                }
-                self.events.extend(events);
-                // Bound the in-memory transcript: the TUI is a window, not an archive.
-                const MAX_EVENTS: usize = 5_000;
-                if self.events.len() > MAX_EVENTS {
-                    let drop = self.events.len() - MAX_EVENTS;
-                    self.events.drain(..drop);
-                }
-                if self.follow {
-                    self.event_scroll = u16::MAX;
+                for event in events {
+                    self.ingest(event);
                 }
             }
             AppMsg::Permissions(requests) => {
@@ -413,12 +454,24 @@ impl App {
             }
             AppMsg::Usage(usage) => self.usage = usage,
             AppMsg::Tools(tools) => self.tools = tools,
+            AppMsg::Stream(event) => {
+                self.stream_live = true;
+                self.ingest(event);
+            }
+            AppMsg::StreamClosed(failed) => {
+                self.stream_live = false;
+                // A broken stream is not a dead daemon: the poller still works
+                // and the stream task reconnects on its own.
+                let _ = failed;
+            }
             AppMsg::ActionDone(text) => {
                 self.set_status(text, false);
                 // A lifecycle action invalidates the cached detail immediately.
                 self.detail = None;
                 self.detail_for = None;
+                self.fetching = false;
             }
+            AppMsg::Failed(text) => self.set_status(text, true),
             AppMsg::Error(text) => {
                 self.fetching = false;
                 self.online = false;
@@ -429,6 +482,17 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // The transcript belongs to whoever was selected when the key was
+        // pressed, so a selection change discards it.
+        let before = self.selected_id();
+        let action = self.handle_key_inner(key);
+        if self.selected_id() != before {
+            self.reset_transcript();
+        }
+        action
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Option<Action> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // 1. Overlays and inputs own the keyboard while open.
@@ -479,6 +543,34 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+            return None;
+        }
+        if self.new_agent_input.is_some() {
+            let mut submit: Option<String> = None;
+            let mut cancel = false;
+            if let Some(buffer) = &mut self.new_agent_input {
+                match key.code {
+                    KeyCode::Esc => cancel = true,
+                    KeyCode::Enter => submit = Some(buffer.trim().to_string()),
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) if !ctrl => buffer.push(c),
+                    _ => {}
+                }
+            }
+            if cancel {
+                self.new_agent_input = None;
+            }
+            if let Some(path) = submit {
+                self.new_agent_input = None;
+                if path.is_empty() {
+                    self.set_status("a spec path is required", true);
+                } else {
+                    self.set_status(format!("creating {path}…"), false);
+                    self.pending_create = Some(path);
+                }
             }
             return None;
         }
@@ -559,6 +651,15 @@ impl App {
 
         // 3. Agent-level commands (always target the selected agent).
         match key.code {
+            KeyCode::Char('n') if !(self.focus == Focus::Main && self.tab == Tab::Permissions) => {
+                let default = if std::path::Path::new("agent.yaml").is_file() {
+                    "agent.yaml"
+                } else {
+                    ""
+                };
+                self.new_agent_input = Some(default.to_string());
+                return None;
+            }
             KeyCode::Char('/') => {
                 self.filter_input = Some(self.filter.clone());
                 self.focus = Focus::Agents;
@@ -720,6 +821,66 @@ impl App {
 // ---------------------------------------------------------------------------
 // Network: one snapshot per refresh
 // ---------------------------------------------------------------------------
+
+/// One long-lived SSE connection with transparent reconnects.
+///
+/// The task tracks its own cursor, so a reconnect resumes exactly where the
+/// last received durable frame stopped instead of re-reading the log.
+fn spawn_stream(client: Client, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let mut after = 0i64;
+        loop {
+            let result = client
+                .stream_events(after, |event| {
+                    if let Some(seq) = event["seq"].as_i64() {
+                        if seq > after {
+                            after = seq;
+                        }
+                    }
+                    let _ = tx.send(AppMsg::Stream(event));
+                })
+                .await;
+            let _ = tx.send(AppMsg::StreamClosed(result.is_err()));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Read, validate, create and start an agent from a spec file.
+async fn create_and_start(client: &Client, path: &str) -> Result<String, String> {
+    let yaml = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let spec =
+        kern_core::config::parse_agent_spec(&yaml).map_err(|e| format!("invalid {path}: {e}"))?;
+    let value = serde_json::to_value(&spec).map_err(|e| format!("serialize spec: {e}"))?;
+    let created = client
+        .create_agent(&value)
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = created["id"]
+        .as_str()
+        .ok_or("create response missing id")?
+        .to_string();
+    let name = created["name"].as_str().unwrap_or(&id).to_string();
+    client
+        .lifecycle(&id, "start")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("created and started {name}"))
+}
+
+/// Run a pending create request off the UI thread.
+fn spawn_create(client: Client, path: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        match create_and_start(&client, &path).await {
+            Ok(message) => {
+                let _ = tx.send(AppMsg::ActionDone(message));
+            }
+            Err(error) => {
+                let _ = tx.send(AppMsg::Failed(error));
+            }
+        }
+    });
+}
 
 fn spawn_fetch(client: Client, selected: Option<(String, i64)>, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
@@ -1112,9 +1273,10 @@ fn field(label: &str, value: impl Into<String>, color: Color) -> Line<'static> {
 
 fn render_events(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(
-        " events  ({})  follow:{} ",
+        " events  ({})  follow:{}  live:{} ",
         app.events.len(),
-        if app.follow { "on" } else { "off" }
+        if app.follow { "on" } else { "off" },
+        if app.stream_live { "●" } else { "○" }
     );
     let block = panel(title, app.focus == Focus::Main);
     let inner = block.inner(area);
@@ -1134,11 +1296,7 @@ fn render_events(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let width = inner.width.saturating_sub(2) as usize;
-    let lines: Vec<Line> = app
-        .events
-        .iter()
-        .map(|event| event_line(event, width))
-        .collect();
+    let lines = event_lines(&app.events, width);
     let height = inner.height as usize;
     let scroll = if app.follow {
         lines.len().saturating_sub(height) as u16
@@ -1146,6 +1304,47 @@ fn render_events(f: &mut Frame, app: &App, area: Rect) {
         app.event_scroll.min(lines.len().saturating_sub(1) as u16)
     };
     f.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
+}
+
+/// Fold consecutive `model.delta` frames into one line, so a streamed turn
+/// reads as text instead of one line per token. The newest text wins when the
+/// line is wider than the pane.
+fn event_lines(events: &[Value], width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(events.len());
+    let mut delta = String::new();
+    for event in events {
+        if event["kind"].as_str() == Some("model.delta") {
+            if let Some(text) = event["payload"]["text"].as_str() {
+                delta.push_str(text);
+            }
+            continue;
+        }
+        if !delta.is_empty() {
+            lines.push(delta_line(&delta, width));
+            delta.clear();
+        }
+        lines.push(event_line(event, width));
+    }
+    if !delta.is_empty() {
+        lines.push(delta_line(&delta, width));
+    }
+    lines
+}
+
+fn delta_line(text: &str, width: usize) -> Line<'static> {
+    let budget = width.saturating_sub(12);
+    let shown: String = {
+        let chars = text.chars().count();
+        text.chars().skip(chars.saturating_sub(budget)).collect()
+    };
+    Line::from(vec![
+        Span::styled("      ⋯ ", Style::default().fg(DIM)),
+        Span::styled(
+            format!("{:<22}", "model.delta"),
+            Style::default().fg(Color::Rgb(120, 190, 240)),
+        ),
+        Span::styled(shown, Style::default().fg(Color::Rgb(170, 210, 245))),
+    ])
 }
 
 fn event_line(event: &Value, width: usize) -> Line<'static> {
@@ -1319,10 +1518,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let keys = match (app.focus, app.tab) {
-        (Focus::Agents, _) => " [↑↓] select  [1-4] tab  [m]essage  [s]tart  [p]ause  [u]resume  [c]heckpoint  [t]erminate  [/]filter  [?]help  [q]uit",
+        (Focus::Agents, _) => " [↑↓] select  [n]ew agent  [1-4] tab  [m]essage  [s]tart  [p]ause  [u]resume  [c]heckpoint  [t]erminate  [/]filter  [?]help  [q]uit",
         (Focus::Main, Tab::Events) => " [j/k] scroll  [f]ollow  [g/G] top/bottom  [h] agents  [1-4] tab  [m]essage  [?]help  [q]uit",
         (Focus::Main, Tab::Permissions) => " [j/k] select  [y] grant  [n] deny  [h] agents  [1-4] tab  [?]help  [q]uit",
-        (Focus::Main, _) => " [h] agents  [1-4] tab  [m]essage  [s]tart  [p]ause  [u]resume  [c]heckpoint  [t]erminate  [?]help  [q]uit",
+        (Focus::Main, _) => " [h] agents  [n]ew agent  [1-4] tab  [m]essage  [s]tart  [p]ause  [u]resume  [c]heckpoint  [t]erminate  [?]help  [q]uit",
     };
     f.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(DIM))),
@@ -1338,6 +1537,20 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(input.buffer.clone()),
             Span::styled("▏", Style::default().fg(TEAL)),
             Span::styled("   [enter] send  [esc] cancel", Style::default().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line), rows[1]);
+    } else if let Some(path) = &app.new_agent_input {
+        let line = Line::from(vec![
+            Span::styled(
+                "new agent from spec: ",
+                Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(path.clone()),
+            Span::styled("▏", Style::default().fg(TEAL)),
+            Span::styled(
+                "   [enter] create + start  [esc] cancel",
+                Style::default().fg(DIM),
+            ),
         ]);
         f.render_widget(Paragraph::new(line), rows[1]);
     } else if let Some(filter) = &app.filter_input {
@@ -1413,6 +1626,7 @@ fn render_help(f: &mut Frame, app: &App) {
             "m",
             "message the selected agent (delivered at its next safe point)",
         ),
+        ("n", "create and start an agent from a spec file"),
         ("s p u c", "start · pause · resume · checkpoint"),
         ("t", "terminate (asks for confirmation)"),
         ("y / n", "grant / deny the selected approval"),
@@ -1574,6 +1788,7 @@ async fn run_loop(
     }
 
     let mut app = App::new(daemon);
+    spawn_stream(client.clone(), tx.clone());
     let mut ticker = tokio::time::interval(refresh);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1581,6 +1796,9 @@ async fn run_loop(
         terminal
             .draw(|f| render(f, &app))
             .map_err(|e| format!("draw: {e}"))?;
+        if let Some(path) = app.pending_create.take() {
+            spawn_create(client.clone(), path, tx.clone());
+        }
         if app.quit {
             break;
         }
@@ -1883,5 +2101,109 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("terminate agent"), "{text}");
         assert!(text.contains("researcher"), "{text}");
+    }
+
+    fn streamed(seq: i64, kind: &str, agent_id: &str, payload: Value) -> AppMsg {
+        AppMsg::Stream(serde_json::json!({
+            "seq": seq,
+            "ts": "2026-11-03T00:00:00Z",
+            "kind": kind,
+            "agent_id": agent_id,
+            "payload": payload,
+        }))
+    }
+
+    #[test]
+    fn stream_ingest_filters_and_dedupes() {
+        let mut app = app_with_agents();
+        app.apply(streamed(3, "agent.started", "id-1", Value::Null));
+        assert_eq!(app.events.len(), 1);
+        assert!(app.stream_live);
+
+        // A replay of an already-seen seq is ignored.
+        app.apply(streamed(3, "agent.started", "id-1", Value::Null));
+        assert_eq!(app.events.len(), 1);
+
+        // Another agent's events never reach the selected transcript.
+        app.apply(streamed(4, "agent.started", "id-2", Value::Null));
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(app.event_cursor, 3);
+
+        // Transient deltas (`seq == 0`) are kept and do not move the cursor.
+        app.apply(streamed(
+            0,
+            "model.delta",
+            "id-1",
+            serde_json::json!({ "text": "hel" }),
+        ));
+        assert_eq!(app.events.len(), 2);
+        assert_eq!(app.event_cursor, 3);
+    }
+
+    #[test]
+    fn stream_closed_does_not_mark_the_daemon_offline() {
+        let mut app = app_with_agents();
+        app.apply(streamed(1, "agent.started", "id-1", Value::Null));
+        assert!(app.stream_live);
+        app.apply(AppMsg::StreamClosed(true));
+        assert!(!app.stream_live);
+        assert!(app.online, "a broken stream is not a dead daemon");
+    }
+
+    #[test]
+    fn selecting_another_agent_resets_the_transcript() {
+        let mut app = app_with_agents();
+        app.apply(streamed(9, "agent.started", "id-1", Value::Null));
+        assert_eq!(app.events.len(), 1);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.events.len(), 0);
+        assert_eq!(app.event_cursor, 0);
+    }
+
+    #[test]
+    fn new_agent_prompt_collects_a_path() {
+        let mut app = app_with_agents();
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.new_agent_input.is_some(), "`n` opens the spec prompt");
+
+        // Replace whatever default was prefilled, then cancel and retry.
+        app.new_agent_input = Some(String::new());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.new_agent_input.is_none());
+        assert!(app.pending_create.is_none());
+
+        app.handle_key(key(KeyCode::Char('n')));
+        app.new_agent_input = Some(String::new());
+        for ch in "ops.yaml".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.new_agent_input.is_none());
+        assert_eq!(app.pending_create.as_deref(), Some("ops.yaml"));
+    }
+
+    #[test]
+    fn delta_frames_coalesce_into_one_line() {
+        let mut app = app_with_agents();
+        app.tab = Tab::Events;
+        for text in ["Hello", ", ", "world"] {
+            app.apply(streamed(
+                0,
+                "model.delta",
+                "id-1",
+                serde_json::json!({ "text": text }),
+            ));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Hello, world"),
+            "deltas must read as text:\n{text}"
+        );
+        assert!(
+            text.contains("live:●"),
+            "stream state must be visible:\n{text}"
+        );
     }
 }

@@ -22,8 +22,8 @@ path = "src/main.rs"
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-kern-core = { version = "0.2.0", path = "../kern-core" }
-kern-model = { version = "0.2.0", path = "../kern-model" }
+kern-core = { version = "0.3.0", path = "../kern-core" }
+kern-model = { version = "0.3.0", path = "../kern-model" }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
