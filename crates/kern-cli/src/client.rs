@@ -308,6 +308,60 @@ impl Client {
         .await
     }
 
+    /// `GET /events/stream?after={seq}` — SSE over the durable log plus the
+    /// live `model.delta` frames. Each decoded frame is passed to `on_event`.
+    ///
+    /// Uses its own HTTP client: the shared one carries a 30 s total timeout,
+    /// which would cut a healthy stream every half minute.
+    pub async fn stream_events<F: FnMut(Value)>(
+        &self,
+        after: i64,
+        mut on_event: F,
+    ) -> Result<(), ClientError> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| ClientError::Transport(format!("build stream client: {e}")))?;
+        let request = self
+            .authed(http.get(format!("{}/events/stream?after={after}", self.base)))
+            .header("accept", "text/event-stream");
+        let mut response = request.send().await.map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                ClientError::Unreachable(self.base.clone())
+            } else {
+                ClientError::Transport(format!("stream request failed: {e}"))
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self.error_from(status, response).await);
+        }
+        let mut buffer: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ClientError::Transport(format!("read stream: {e}")))?
+        {
+            buffer.extend_from_slice(&chunk);
+            while let Some((end, delimiter)) = frame_end(&buffer) {
+                let frame: Vec<u8> = buffer.drain(..end + delimiter).collect();
+                for line in String::from_utf8_lossy(&frame).lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        on_event(event);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `GET /usage`
     pub async fn usage(&self) -> Result<Value, ClientError> {
         self.json_response(self.authed(self.http.get(format!("{}/usage", self.base))))
@@ -363,6 +417,22 @@ impl Client {
                 matches.len()
             ))),
         }
+    }
+}
+
+/// The end of the first SSE frame in `buffer` plus the delimiter's length.
+///
+/// Frames are terminated by a blank line; servers differ on LF vs CRLF, so
+/// both are accepted and the earliest terminator wins.
+fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+        (a, b) => a.or(b),
     }
 }
 

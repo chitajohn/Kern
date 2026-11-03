@@ -944,6 +944,15 @@ A full-screen dashboard over the same API; it adds no endpoints and no state.
   `s` start, `p` pause, `u` resume, `c` checkpoint, `t` terminate (requires a second
   confirmation), `m` message (`POST /agents/{id}/messages`), `y`/`n` grant/deny
   (`POST /permissions/{id}/{grant,deny}`). The TUI holds no authoritative state.
+- **Live stream.** One `GET /events/stream?after=` connection per TUI run. Frames for other
+  agents are dropped client-side; durable frames are deduped by `seq`, transient `model.delta`
+  frames (`seq == 0`) are kept and coalesced for display. A closed stream shows `live:○` and the
+  client reconnects from the last durable `seq` it received, with no replay gap and no duplicate
+  rows. Stream state is independent of daemon health: a broken stream never marks the daemon
+  offline, and an unreachable daemon still closes the stream.
+- **Create.** `n` reads a spec file, validates it with the same loader as `kern run`
+  (`parse_agent_spec`), then `POST /agents` followed by `POST /agents/{id}/start`; validation and
+  API errors are reported on the status line without changing daemon health.
 - **Failure.** A failed poll marks the header `offline` and keeps the last snapshot visible
   with a warning; it never presents stale data as live and never exits on a transient error.
 - **Terminal.** Raw mode and the alternate screen are restored on every exit path, including

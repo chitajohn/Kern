@@ -1639,6 +1639,20 @@ incremental, so a long-running agent costs one query per interval regardless of 
 The in-memory transcript is capped (5,000 events) because the TUI is a window, not the archive —
 `kern logs` and the store remain the durable record.
 
+**Streaming.** The Events pane is fed by a single SSE connection to `/events/stream`, separate
+from the polling snapshot. The connection replays the durable tail once (the cursor is the last
+`seq` the client saw) and then follows live; the task owns its cursor, so a reconnect resumes
+without a gap or duplicates, and the page is never re-read. Frames for other agents are dropped
+client-side, which keeps one connection valid across selection changes. Consecutive
+`model.delta` frames are folded into a single line — the newest text is shown when it overflows —
+because one line per token is unreadable and unbounded. Stream health is reported separately
+(`live:●/○`): the daemon can be perfectly healthy with a broken stream, and vice versa.
+
+**Creating agents.** `n` takes a spec path, validates it with `parse_agent_spec` (the same loader
+`kern run` uses, so a TUI-created agent cannot differ from a CLI-created one), then calls
+`POST /agents` and `POST /agents/{id}/start`. Errors go to the status line and never touch the
+header's daemon state.
+
 **Truthful failure.** A failed poll flips the header to `offline` and keeps the last snapshot
 with a visible warning. Blanking the screen would look like "no agents"; showing the snapshot as
 if live would be worse. The loop keeps retrying, and `r` forces a poll.

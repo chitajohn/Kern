@@ -3,7 +3,7 @@
 All notable changes to Kern. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] — 2026-11-03
 
 ### Added
 
@@ -16,6 +16,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   flip the header to `offline` and keep the last snapshot with a visible warning instead of
   presenting stale data as live. Needs an interactive terminal; the plain-text commands stay
   available for scripts.
+- **Live streaming in the TUI.** The dashboard holds one SSE connection
+  (`GET /events/stream`) that replays the durable log once and then follows live, reconnecting on
+  its own from the last frame it saw. Consecutive `model.delta` frames fold into a single line, so
+  a streamed turn reads as text instead of one line per token; the Events header shows the
+  connection state separately from the daemon's.
+- **Create agents from the TUI.** `n` takes a spec path (prefilled with `agent.yaml`), validates it
+  with the same loader the CLI uses, creates and starts the agent, and refreshes the list. Parse
+  and API errors land on the status line without being mistaken for a dead daemon.
 
 ## [0.2.0] — 2026-11-03
 
