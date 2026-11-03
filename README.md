@@ -164,6 +164,7 @@ The CLI is a control interface to the runtime, not the runtime itself. It talks 
 | `kern daemon` | Run the runtime (foreground, logs to `~/.kern/logs/runtime.jsonl`) |
 | `kern run agent.yaml [--wait]` | Validate, create, and start an agent |
 | `kern ps` | List agents and their lifecycle state |
+| `kern tui` | Full-screen dashboard: agents, live events, approvals, usage, tools |
 | `kern logs <agent> [-f]` | Durable event replay (or follow live) |
 | `kern inspect <agent>` | Spec summary, state, latest checkpoint |
 | `kern pause` / `resume` / `checkpoint` / `terminate` | Lifecycle control |

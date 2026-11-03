@@ -14,6 +14,7 @@ mod daemon;
 mod doctor;
 mod init;
 mod table;
+mod tui;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +67,12 @@ enum Command {
     Doctor,
     /// Table of agents: name, id, state, updated.
     Ps,
+    /// Full-screen dashboard: agents, live events, approvals, usage, tools.
+    Tui {
+        /// Refresh interval for daemon polls, in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        refresh_ms: u64,
+    },
     /// Tail an agent's events (follow with -f).
     Logs {
         /// Agent name or id.
@@ -205,6 +212,7 @@ async fn dispatch(cli: Cli) -> Result<i32, String> {
         Command::Run { spec, wait } => cmd_run(&spec, wait).await,
         Command::Doctor => cmd_doctor(home).await,
         Command::Ps => cmd_ps().await,
+        Command::Tui { refresh_ms } => cmd_tui(refresh_ms).await,
         Command::Logs {
             target,
             follow,
@@ -402,6 +410,10 @@ async fn cmd_ps() -> Result<i32, String> {
         .collect();
     table::print_table(&["NAME", "ID", "STATE", "UPDATED"], &rows);
     Ok(0)
+}
+
+async fn cmd_tui(refresh_ms: u64) -> Result<i32, String> {
+    tui::run(Duration::from_millis(refresh_ms)).await
 }
 
 async fn cmd_logs(target: &str, follow: bool, limit: usize) -> Result<i32, String> {

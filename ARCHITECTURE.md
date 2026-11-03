@@ -1617,3 +1617,38 @@ The event log is the audit trail, so nothing prunes it on a schedule. Compaction
 operator action: `kern compact --per-agent N` (`POST /events/compact`) keeps the newest `N`
 events per agent and reports how many rows were removed. `seq` stays monotonic; replay cursors
 that point at pruned events simply see the gap, which the SSE resume path already handles.
+
+---
+
+## 38. Terminal dashboard (`kern tui`)
+
+`kern tui` is a client, not a second runtime. It opens no database, adds no endpoint and keeps
+no authoritative state; everything it shows came from the same API `kern ps`/`logs`/`usage` use,
+and everything it changes goes through the existing lifecycle, message and approval endpoints.
+
+**Layout.** A one-line header (wordmark, version, daemon state, agent count, token totals,
+schema), a sidebar with the Kern face logo plus the agent list, a tabbed main panel
+(`Overview`, `Events`, `Permissions`, `Tools`), and two footer lines: the keys that apply to the
+current focus, then either the message/filter input, the last action result, or the offline
+warning. The logo is drawn per cell (teal body, dark-teal visor, bright eyes) rather than as
+pre-coloured ANSI, so it composes with ratatui's diffing and survives `NO_COLOR`.
+
+**Polling.** One snapshot per tick: agents, approvals, usage and the tool catalog, plus the
+selected agent's events *after the highest `seq` already seen* and its detail. Event polling is
+incremental, so a long-running agent costs one query per interval regardless of history size.
+The in-memory transcript is capped (5,000 events) because the TUI is a window, not the archive —
+`kern logs` and the store remain the durable record.
+
+**Truthful failure.** A failed poll flips the header to `offline` and keeps the last snapshot
+with a visible warning. Blanking the screen would look like "no agents"; showing the snapshot as
+if live would be worse. The loop keeps retrying, and `r` forces a poll.
+
+**Safety.** Every mutation is an explicit key, terminate is confirmed, and messages are rejected
+when empty. The keyboard thread forwards presses only (crossterm emits releases on Windows),
+raw mode and the alternate screen are restored on the success path, on errors, and through a
+panic hook.
+
+**Testing.** Rendering is asserted through ratatui's `TestBackend` (logo, agent list, tabs,
+overview fields, usage header, event line, overlays) and the state machine is unit-tested
+against synthetic API payloads, so the dashboard is verifiable without a live daemon or a
+terminal.
