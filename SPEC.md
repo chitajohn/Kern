@@ -918,6 +918,7 @@ data: {…}
 | `kern doctor` | environment health: DB integrity, schema version, sandbox backend, provider keys present, API reachable; exit 0/1 |
 | `kern schedule <name\|id>` | show schedule and next run time |
 | `kern ps` | table of agents: name, id, state, updated_at |
+| `kern tui [--refresh-ms <n>]` | full-screen dashboard over the local API (§16.1) |
 | `kern logs <name\|id>` | tail events (follow with `-f`) |
 | `kern inspect <name\|id>` | agent detail + latest checkpoint summary + last error |
 | `kern pause\|resume\|checkpoint\|terminate <name\|id>` | lifecycle control |
@@ -928,7 +929,25 @@ data: {…}
 | `kern mcp serve agent.yaml [--workspace DIR]` | serve the spec's stateless tools over MCP stdio (§36) |
 | `kern version` | version + API address |
 
-Exit codes: `0` success, `1` runtime/client error, `2` usage error.
+Exit codes: `0` success, `1` runtime/client error, `2` usage error (including a non-interactive
+stdout, which is a usage error rather than a hang).
+
+### 16.1 `kern tui` (normative)
+
+A full-screen dashboard over the same API; it adds no endpoints and no state.
+
+- **Reads.** `GET /agents`, `GET /permissions/pending`, `GET /usage` and `GET /tools` on every
+  refresh (`--refresh-ms`, default `1000`, floor `250`), plus `GET /agents/{id}/events?after=<last
+  seq>` and `GET /agents/{id}` for the selected agent. Event polling is incremental: the client
+  remembers the highest `seq` it has seen and never re-fetches history.
+- **Writes.** Only on an explicit key press, always as the corresponding existing endpoint:
+  `s` start, `p` pause, `u` resume, `c` checkpoint, `t` terminate (requires a second
+  confirmation), `m` message (`POST /agents/{id}/messages`), `y`/`n` grant/deny
+  (`POST /permissions/{id}/{grant,deny}`). The TUI holds no authoritative state.
+- **Failure.** A failed poll marks the header `offline` and keeps the last snapshot visible
+  with a warning; it never presents stale data as live and never exits on a transient error.
+- **Terminal.** Raw mode and the alternate screen are restored on every exit path, including
+  panics.
 
 ---
 

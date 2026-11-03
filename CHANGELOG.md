@@ -3,6 +3,20 @@
 All notable changes to Kern. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`kern tui`** — a full-screen dashboard over the same local API every other command
+  uses: the agent list with live lifecycle glyphs, an event stream that follows the selected
+  agent, pending-approval review with grant/deny, agent detail, a tool catalog, and usage
+  totals in the header. It renders the Kern logo in the sidebar and the help overlay, filters
+  agents by name/id/state, and sends messages and lifecycle actions (start, pause, resume,
+  checkpoint, terminate-with-confirmation) without leaving the terminal. Connection failures
+  flip the header to `offline` and keep the last snapshot with a visible warning instead of
+  presenting stale data as live. Needs an interactive terminal; the plain-text commands stay
+  available for scripts.
+
 ## [0.2.0] — 2026-11-03
 
 Every item deferred from 0.1 is now either shipped or an explicit boundary (see
