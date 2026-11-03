@@ -513,7 +513,7 @@ impl Store {
     pub fn get_execution(&self, id: &str) -> Result<Execution> {
         self.with_reader(|conn| {
             conn.query_row(
-                "SELECT id, agent_id, status, started_at, finished_at, latest_checkpoint_id, input, wake_at FROM executions WHERE id = ?1",
+                "SELECT id, agent_id, status, started_at, finished_at, latest_checkpoint_id, input, wake_at, input_tokens, output_tokens FROM executions WHERE id = ?1",
                 params![id],
                 execution_from_row,
             )
@@ -527,7 +527,7 @@ impl Store {
         self.with_reader(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, agent_id, status, started_at, finished_at, latest_checkpoint_id, input, wake_at
+                    "SELECT id, agent_id, status, started_at, finished_at, latest_checkpoint_id, input, wake_at, input_tokens, output_tokens
                      FROM executions WHERE agent_id = ?1 ORDER BY started_at DESC",
                 )
                 .map_err(|e| map_sqlite_error(e, "list executions"))?;
@@ -665,7 +665,8 @@ impl Store {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.id, e.agent_id, e.status, e.started_at, e.finished_at,
-                            e.latest_checkpoint_id, e.input, e.wake_at
+                            e.latest_checkpoint_id, e.input, e.wake_at,
+                            e.input_tokens, e.output_tokens
                      FROM executions e
                      JOIN agents a ON a.id = e.agent_id
                      WHERE a.lifecycle_state = 'sleeping'
@@ -721,6 +722,54 @@ impl Store {
                 )
                 .map_err(|e| map_sqlite_error(e, "fail pending execution"))?;
             Ok(changed > 0)
+        })
+    }
+
+    /// Add one turn's tokens to an execution (durable immediately, so a
+    /// crashed run keeps every counted turn). Negative/none contributions are
+    /// ignored by the caller.
+    pub fn add_execution_usage(&self, execution_id: &str, input: u64, output: u64) -> Result<()> {
+        if input == 0 && output == 0 {
+            return Ok(());
+        }
+        self.with_writer(|conn| {
+            conn.execute(
+                "UPDATE executions
+                    SET input_tokens = input_tokens + ?1,
+                        output_tokens = output_tokens + ?2
+                  WHERE id = ?3",
+                params![input as i64, output as i64, execution_id],
+            )
+            .map_err(|e| map_sqlite_error(e, "add execution usage"))?;
+            Ok(())
+        })
+    }
+
+    /// Aggregate token totals across executions, optionally for one agent.
+    pub fn usage_totals(&self, agent_id: Option<&str>) -> Result<UsageTotals> {
+        self.with_reader(|conn| {
+            let (sql, id) = match agent_id {
+                Some(id) => (
+                    "SELECT COALESCE(SUM(input_tokens), 0),
+                            COALESCE(SUM(output_tokens), 0),
+                            COALESCE(SUM(CASE WHEN input_tokens + output_tokens > 0 THEN 1 ELSE 0 END), 0)
+                       FROM executions WHERE agent_id = ?1",
+                    Some(id),
+                ),
+                None => (
+                    "SELECT COALESCE(SUM(input_tokens), 0),
+                            COALESCE(SUM(output_tokens), 0),
+                            COALESCE(SUM(CASE WHEN input_tokens + output_tokens > 0 THEN 1 ELSE 0 END), 0)
+                       FROM executions",
+                    None,
+                ),
+            };
+            let row = match id {
+                Some(id) => conn.query_row(sql, params![id], usage_row),
+                None => conn.query_row(sql, [], usage_row),
+            }
+            .map_err(|e| map_sqlite_error(e, "usage totals"))?;
+            Ok(row)
         })
     }
 
@@ -1554,6 +1603,8 @@ fn execution_from_row(row: &Row) -> rusqlite::Result<Execution> {
         latest_checkpoint_id: row.get(5)?,
         input: row.get(6)?,
         wake_at: opt_ts_from_row(row.get::<_, Option<String>>(7)?)?,
+        input_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
+        output_tokens: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64,
     })
 }
 
@@ -1667,6 +1718,15 @@ fn now_rfc3339() -> String {
 
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Map one aggregate-usage row (`input`, `output`, `executions`).
+fn usage_row(row: &Row) -> rusqlite::Result<UsageTotals> {
+    Ok(UsageTotals {
+        input_tokens: row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u64,
+        output_tokens: row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,
+        executions: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+    })
 }
 
 fn opt_ts(t: Option<DateTime<Utc>>) -> Option<String> {

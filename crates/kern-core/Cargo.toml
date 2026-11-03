@@ -33,8 +33,8 @@ glob = { workspace = true }
 libc = { workspace = true }
 idna = { workspace = true }
 url = { workspace = true }
-kern-model = { version = "0.1.0", path = "../kern-model" }
-kern-tool = { version = "0.1.0", path = "../kern-tool" }
+kern-model = { version = "0.2.0", path = "../kern-model" }
+kern-tool = { version = "0.2.0", path = "../kern-tool" }
 
 [[bench]]
 name = "limits"

@@ -801,11 +801,25 @@ pub fn construct(
 pub struct SandboxedRunner {
     sandbox: Arc<dyn Sandbox>,
     limits: RunLimits,
+    /// Explicitly granted environment (§33): the only secrets a tool
+    /// subprocess ever sees beyond the non-secret allowlist.
+    env: Vec<(String, String)>,
 }
 
 impl SandboxedRunner {
     pub fn new(sandbox: Arc<dyn Sandbox>, limits: RunLimits) -> Self {
-        Self { sandbox, limits }
+        Self {
+            sandbox,
+            limits,
+            env: Vec::new(),
+        }
+    }
+
+    /// Inject the credentials granted to the `shell` tool. Applied after the
+    /// environment scrub, so a grant is the only path to a secret.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn sandbox_name(&self) -> &'static str {
@@ -833,6 +847,9 @@ impl CommandRunner for SandboxedRunner {
         // installed (bwrap's --clearenv already scrubs, landlock/rlimits/
         // none do not).
         scrub_tool_env(&mut cmd);
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
         self.sandbox
             .prepare_child(cmd.as_std_mut())
             .map_err(|e| ToolError::Failed(format!("{}: {e}", self.sandbox.name())))?;

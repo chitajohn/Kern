@@ -121,6 +121,7 @@ pub fn build_shell_tool(
     workspace: &Path,
     tool_timeout: Duration,
     memory_limit_bytes: Option<u64>,
+    credential_env: Vec<(String, String)>,
 ) -> Result<Option<ShellTool>, KernError> {
     let Some(shell) = shell else {
         return Ok(None);
@@ -137,7 +138,8 @@ pub fn build_shell_tool(
     };
     let sandbox = construct_sandbox(mode, workspace, &limits)
         .map_err(|e| KernError::new(ErrorCode::SandboxUnavailable, e.to_string()))?;
-    let runner: Arc<dyn CommandRunner> = Arc::new(SandboxedRunner::new(sandbox, limits));
+    let runner: Arc<dyn CommandRunner> =
+        Arc::new(SandboxedRunner::new(sandbox, limits).with_env(credential_env));
     Ok(Some(ShellTool::new(runner)))
 }
 
@@ -168,15 +170,26 @@ pub async fn build_registry(
     spec: &AgentSpec,
     store: Arc<Store>,
     workspace: &Path,
+    engine: Option<&crate::engine::Engine>,
 ) -> Result<Arc<ToolRegistry>, KernError> {
     let permissions = PermissionEngine::from_config(&spec.permissions, workspace)?;
     let mut registry = ToolRegistry::new();
     let tool_timeout = spec.runtime.tool_timeout().as_std();
 
+    // Credential grants (§33): resolved once per agent start (fail closed on a
+    // missing source) and handed only to the tools that were granted them.
+    let memory = crate::memory::build_provider(&spec.memory, Arc::clone(&store), workspace);
+    let credentials = spec.resolve_credentials()?;
+    let shell_env: Vec<(String, String)> =
+        credentials.iter().filter_map(|c| c.shell_env()).collect();
+    let http_headers: Vec<(String, String)> =
+        credentials.iter().filter_map(|c| c.http_header()).collect();
+    let mcp_env: Vec<(String, String)> = credentials.iter().filter_map(|c| c.mcp_env()).collect();
+
     for name in &spec.tools {
         // MCP tools are registered below, once their server has connected and
-        // actually advertised them.
-        if spec.mcp.is_mcp_tool(name) {
+        // actually advertised them; sub-agent tools are registered below too.
+        if spec.mcp.is_mcp_tool(name) || name.starts_with("agent.") {
             continue;
         }
         let tool: Arc<dyn kern_tool::Tool> = match name.as_str() {
@@ -184,10 +197,10 @@ pub async fn build_registry(
                 permissions.fs_roots(FsAction::Read),
                 permissions.fs_roots(FsAction::Write),
             )),
-            "http" => Arc::new(HttpTool::new(
-                permissions.network_allow_hosts(),
-                HTTP_MAX_RESPONSE_BYTES,
-            )),
+            "http" => Arc::new(
+                HttpTool::new(permissions.network_allow_hosts(), HTTP_MAX_RESPONSE_BYTES)
+                    .with_granted_headers(http_headers.clone()),
+            ),
             "memory.read" => {
                 if !spec.memory.enabled {
                     return Err(KernError::new(
@@ -195,7 +208,7 @@ pub async fn build_registry(
                         "memory.read requires memory.enabled: true",
                     ));
                 }
-                Arc::new(MemoryReadTool::new(memory_provider(store.clone())))
+                Arc::new(MemoryReadTool::new(Arc::clone(&memory)))
             }
             "memory.write" => {
                 if !spec.memory.enabled {
@@ -205,7 +218,7 @@ pub async fn build_registry(
                     ));
                 }
                 Arc::new(MemoryWriteTool::with_limits(
-                    memory_provider(store.clone()),
+                    Arc::clone(&memory),
                     spec.memory.max_keys.unwrap_or(100) as usize,
                     spec.memory.max_value_bytes.unwrap_or(65_536) as usize,
                 ))
@@ -217,7 +230,7 @@ pub async fn build_registry(
                         "memory.list requires memory.enabled: true",
                     ));
                 }
-                Arc::new(MemoryListTool::new(memory_provider(store.clone())))
+                Arc::new(MemoryListTool::new(Arc::clone(&memory)))
             }
             "shell" => {
                 match build_shell_tool(
@@ -225,6 +238,7 @@ pub async fn build_registry(
                     workspace,
                     tool_timeout,
                     spec.runtime.tool_memory_limit_bytes(),
+                    shell_env.clone(),
                 )? {
                     Some(tool) => Arc::new(tool),
                     None => {
@@ -249,6 +263,24 @@ pub async fn build_registry(
         })?;
     }
 
+    // Sub-agent tools (§35). They are registered for every declared sub-agent;
+    // `spec.tools` decides which are visible to the model, exactly like MCP.
+    if !spec.subagents.is_empty() {
+        let Some(engine) = engine else {
+            return Err(KernError::new(
+                ErrorCode::Internal,
+                "sub-agents require a running engine to delegate to",
+            ));
+        };
+        for sub in &spec.subagents {
+            let tool = crate::subagents::SubagentTool::new(engine.clone(), spec, sub);
+            let name = kern_tool::Tool::name(&tool).to_string();
+            registry.register(Arc::new(tool)).map_err(|e| {
+                KernError::new(ErrorCode::Internal, format!("register tool {name:?}: {e}"))
+            })?;
+        }
+    }
+
     // MCP servers: connect only the ones this agent names, so an unused
     // server can never block an agent's start.
     for server in &spec.mcp.servers {
@@ -262,11 +294,15 @@ pub async fn build_registry(
         if wanted.is_empty() {
             continue;
         }
+        // Granted credentials first; an explicit `mcp.servers[].env` entry
+        // wins on a name collision (the narrower grant is authoritative).
+        let mut env: std::collections::BTreeMap<String, String> = mcp_env.iter().cloned().collect();
+        env.extend(server.env.clone());
         let mcp_spec = McpServerSpec {
             name: server.name.clone(),
             command: server.command.clone(),
             args: server.args.clone(),
-            env: server.env.clone(),
+            env,
             timeout: server
                 .timeout
                 .as_ref()
@@ -308,8 +344,70 @@ pub async fn build_registry(
     Ok(Arc::new(registry))
 }
 
-fn memory_provider(store: Arc<Store>) -> Arc<dyn MemoryProvider> {
-    Arc::new(StoreMemoryProvider::new(store))
+/// Build the tool catalog for the MCP serving surface (§36).
+///
+/// Only stateless tools are served: a memory, sub-agent, or proxied-MCP tool
+/// needs the daemon's store or engine, so it is rejected at start rather than
+/// served against the wrong state.
+pub fn build_server_registry(
+    spec: &AgentSpec,
+    workspace: &Path,
+) -> Result<Arc<ToolRegistry>, KernError> {
+    let permissions = PermissionEngine::from_config(&spec.permissions, workspace)?;
+    let credentials = spec.resolve_credentials()?;
+    let shell_env: Vec<(String, String)> =
+        credentials.iter().filter_map(|c| c.shell_env()).collect();
+    let http_headers: Vec<(String, String)> =
+        credentials.iter().filter_map(|c| c.http_header()).collect();
+    let tool_timeout = spec.runtime.tool_timeout().as_std();
+    let mut registry = ToolRegistry::new();
+
+    for name in &spec.tools {
+        let tool: Arc<dyn kern_tool::Tool> = match name.as_str() {
+            "filesystem" => Arc::new(FileSystemTool::new(
+                permissions.fs_roots(FsAction::Read),
+                permissions.fs_roots(FsAction::Write),
+            )),
+            "http" => Arc::new(
+                HttpTool::new(permissions.network_allow_hosts(), HTTP_MAX_RESPONSE_BYTES)
+                    .with_granted_headers(http_headers.clone()),
+            ),
+            "shell" => match build_shell_tool(
+                spec.permissions.shell.as_ref(),
+                workspace,
+                tool_timeout,
+                spec.runtime.tool_memory_limit_bytes(),
+                shell_env.clone(),
+            )? {
+                Some(tool) => Arc::new(tool),
+                None => {
+                    return Err(KernError::new(
+                        ErrorCode::ConfigInvalid,
+                        "shell tool requires permissions.shell.enabled: true",
+                    ))
+                }
+            },
+            "noop" => Arc::new(NoopTool),
+            "sleep" => Arc::new(SleepTool),
+            other => {
+                return Err(KernError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "tool {other:?} cannot be served over MCP: it needs the daemon's \
+                         runtime state (serve it through the local API instead)"
+                    ),
+                ))
+            }
+        };
+        let registered = kern_tool::Tool::name(tool.as_ref()).to_string();
+        registry.register(tool).map_err(|e| {
+            KernError::new(
+                ErrorCode::Internal,
+                format!("register tool {registered:?}: {e}"),
+            )
+        })?;
+    }
+    Ok(Arc::new(registry))
 }
 
 /// Build the digest text for `memory.inject_digest`:
@@ -446,7 +544,7 @@ mod tests {
                 .replace("{tools}", "ghost.thing"),
         )
         .expect("config must parse");
-        match build_registry(&spec, store, dir.path()).await {
+        match build_registry(&spec, store, dir.path(), None).await {
             Ok(_) => panic!("a missing server binary must fail the start"),
             Err(err) => {
                 assert_eq!(err.code(), ErrorCode::ToolUnavailable);
@@ -466,7 +564,7 @@ mod tests {
                 .replace("{tools}", "noop"),
         )
         .expect("config must parse");
-        let registry = build_registry(&spec, store, dir.path())
+        let registry = build_registry(&spec, store, dir.path(), None)
             .await
             .expect("the unused server must not be spawned");
         assert!(registry.has("noop"));
@@ -486,7 +584,7 @@ mod tests {
         let ws = workspace();
         let timeout = Duration::from_secs(30);
         // No permissions.shell block at all.
-        assert!(build_shell_tool(None, ws.path(), timeout, None)
+        assert!(build_shell_tool(None, ws.path(), timeout, None, Vec::new())
             .unwrap()
             .is_none());
         // Disabled explicitly.
@@ -494,9 +592,11 @@ mod tests {
             enabled: false,
             sandbox: Some(SandboxMode::Required),
         };
-        assert!(build_shell_tool(Some(&disabled), ws.path(), timeout, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            build_shell_tool(Some(&disabled), ws.path(), timeout, None, Vec::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -506,7 +606,13 @@ mod tests {
             enabled: true,
             sandbox: Some(SandboxMode::Required),
         };
-        match build_shell_tool(Some(&rules), ws.path(), Duration::from_secs(30), None) {
+        match build_shell_tool(
+            Some(&rules),
+            ws.path(),
+            Duration::from_secs(30),
+            None,
+            Vec::new(),
+        ) {
             Ok(Some(_)) => {
                 // A backend is present on this host; construction succeeded.
             }
@@ -525,9 +631,15 @@ mod tests {
             enabled: true,
             sandbox: Some(SandboxMode::Off),
         };
-        let tool = build_shell_tool(Some(&rules), ws.path(), Duration::from_secs(30), None)
-            .unwrap()
-            .expect("off mode always constructs");
+        let tool = build_shell_tool(
+            Some(&rules),
+            ws.path(),
+            Duration::from_secs(30),
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .expect("off mode always constructs");
         let out = tool
             .run(&json!({ "command": "printf 'off-ok'" }), &tool_ctx())
             .await
@@ -547,9 +659,13 @@ mod tests {
             enabled: true,
             sandbox: Some(SandboxMode::BestEffort),
         };
-        let Ok(Some(tool)) =
-            build_shell_tool(Some(&rules), ws.path(), Duration::from_secs(30), None)
-        else {
+        let Ok(Some(tool)) = build_shell_tool(
+            Some(&rules),
+            ws.path(),
+            Duration::from_secs(30),
+            None,
+            Vec::new(),
+        ) else {
             return true; // no backend: the real-process test cannot run
         };
         matches!(
@@ -574,9 +690,15 @@ mod tests {
             enabled: true,
             sandbox: Some(SandboxMode::BestEffort),
         };
-        let tool = build_shell_tool(Some(&rules), ws.path(), Duration::from_secs(30), None)
-            .unwrap()
-            .expect("best-effort always constructs on linux");
+        let tool = build_shell_tool(
+            Some(&rules),
+            ws.path(),
+            Duration::from_secs(30),
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .expect("best-effort always constructs on linux");
         let out = tool
             .run(
                 &json!({ "command": "printf 'best-effort-ok'" }),
@@ -595,9 +717,15 @@ mod tests {
             enabled: true,
             sandbox: Some(SandboxMode::Off),
         };
-        let tool = build_shell_tool(Some(&rules), ws.path(), Duration::from_millis(150), None)
-            .unwrap()
-            .expect("off mode always constructs");
+        let tool = build_shell_tool(
+            Some(&rules),
+            ws.path(),
+            Duration::from_millis(150),
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .expect("off mode always constructs");
         let err = tool
             .run(&json!({ "command": "sleep 30" }), &tool_ctx())
             .await

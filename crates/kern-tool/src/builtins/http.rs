@@ -56,6 +56,9 @@ pub struct HttpTool {
     allowed_hosts: Vec<String>,
     max_response_bytes: usize,
     client: reqwest::Client,
+    /// Runtime-granted headers (credentials, §33). Applied AFTER the model's
+    /// own headers, so a call can never override or observe the secret.
+    granted_headers: Vec<(String, String)>,
 }
 
 impl HttpTool {
@@ -76,7 +79,14 @@ impl HttpTool {
             allowed_hosts: normalized,
             max_response_bytes,
             client,
+            granted_headers: Vec::new(),
         }
+    }
+
+    /// Add headers the runtime injects on every request (§33).
+    pub fn with_granted_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.granted_headers = headers;
+        self
     }
 }
 
@@ -135,6 +145,15 @@ impl Tool for HttpTool {
                 })?;
                 headers.insert(header, header_value);
             }
+        }
+        // Granted headers win: a model-supplied header of the same name is
+        // replaced, never merged, so it cannot shadow a credential.
+        for (name, value) in &self.granted_headers {
+            let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| ToolError::Failed(format!("invalid granted header '{name}': {e}")))?;
+            let header_value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|e| ToolError::Failed(format!("invalid granted header value: {e}")))?;
+            headers.insert(header, header_value);
         }
 
         let timeout = args
@@ -279,6 +298,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["status"], 201);
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn granted_headers_are_sent_and_cannot_be_shadowed() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/secret")
+            .match_header("authorization", "Bearer granted")
+            .with_status(200)
+            .with_body("ok")
+            .create();
+        let host = url::Url::parse(&server.url())
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let http = tool(&[&host]).with_granted_headers(vec![(
+            "Authorization".to_string(),
+            "Bearer granted".to_string(),
+        )]);
+
+        // The model's own Authorization header is replaced, not merged, so it
+        // can neither override nor observe the granted credential.
+        let out = run_tool(
+            &http,
+            json!({
+                "method": "get",
+                "url": format!("{}/secret", server.url()),
+                "headers": { "authorization": "Bearer model-supplied" },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], 200);
         mock.assert();
     }
 

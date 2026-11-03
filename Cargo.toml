@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.90"
@@ -21,7 +21,7 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "fs", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "fs", "net", "io-util", "io-std"] }
 axum = "0.8"
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }

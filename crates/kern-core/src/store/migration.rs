@@ -17,6 +17,7 @@ pub(crate) const MIGRATIONS: &[&dyn Migration] = &[
     &MigrationV3,
     &MigrationV4,
     &MigrationV5,
+    &MigrationV6,
 ];
 
 pub(crate) trait Migration {
@@ -99,6 +100,28 @@ impl Migration for MigrationV5 {
         // message survives a crash, and execution-scoped so a stale message is
         // never delivered to a later run.
         tx.execute_batch(SCHEMA_V5)
+    }
+}
+
+struct MigrationV6;
+
+impl Migration for MigrationV6 {
+    fn version(&self) -> u32 {
+        6
+    }
+
+    fn name(&self) -> &'static str {
+        "v6-token-accounting"
+    }
+
+    fn up(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        // Token accounting (ARCHITECTURE.md §31): cumulative per execution, so
+        // a recovered run continues its count instead of restarting it. The
+        // defaults keep pre-v6 rows readable as zero-counted.
+        tx.execute_batch(
+            "ALTER TABLE executions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;\
+             ALTER TABLE executions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;",
+        )
     }
 }
 

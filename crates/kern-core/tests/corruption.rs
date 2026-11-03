@@ -208,7 +208,7 @@ async fn tool_argument_validation_never_panics_on_hostile_json() {
          memory:\n  enabled: true\npermissions:\n  shell:\n    enabled: true\n    sandbox: off\n  filesystem:\n    read:\n      allow: [./]\n    write:\n      allow: [./]\n  network:\n    allow: [api.example.com]\n",
     )
     .unwrap();
-    let registry = kern_core::tools::build_registry(&spec, Arc::clone(&store), &workspace)
+    let registry = kern_core::tools::build_registry(&spec, Arc::clone(&store), &workspace, None)
         .await
         .expect("registry builds");
 

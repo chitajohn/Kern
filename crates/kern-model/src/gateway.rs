@@ -25,7 +25,7 @@ use crate::error::ModelError;
 use crate::ollama::OllamaProvider;
 use crate::openai::OpenAiProvider;
 use crate::provider::ModelProvider;
-use crate::types::{CompletionRequest, CompletionResponse};
+use crate::types::{Completion, CompletionRequest};
 
 /// `model.timeout` default (SPEC.md §8.2).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,10 +116,11 @@ impl ModelGateway {
     }
 
     /// Run one completion with the full timeout/retry/budget policy.
-    pub async fn complete(
-        &self,
-        req: &CompletionRequest,
-    ) -> Result<CompletionResponse, ModelError> {
+    ///
+    /// The returned [`Completion`] carries the provider's usage for the turn
+    /// that actually produced it — a retried attempt's usage is not counted,
+    /// because only one turn's tokens were billed to this step.
+    pub async fn complete(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
         let provider = self.providers.get(&req.provider).ok_or_else(|| {
             ModelError::Unavailable(format!(
                 "no provider adapter registered for '{}'",
@@ -137,7 +138,7 @@ impl ModelGateway {
             }
 
             let deadline = Instant::now() + timeout;
-            let outcome = tokio::time::timeout_at(deadline, provider.complete(req)).await;
+            let outcome = tokio::time::timeout_at(deadline, provider.complete_counting(req)).await;
 
             let err = match outcome {
                 Ok(Ok(response)) => return Ok(response),
@@ -168,7 +169,7 @@ impl ModelGateway {
         &self,
         req: &CompletionRequest,
         deltas: &crate::provider::DeltaSender,
-    ) -> Result<CompletionResponse, ModelError> {
+    ) -> Result<Completion, ModelError> {
         let provider = self.providers.get(&req.provider).ok_or_else(|| {
             ModelError::Unavailable(format!(
                 "no provider adapter registered for '{}'",
@@ -178,7 +179,7 @@ impl ModelGateway {
 
         let timeout = req.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let deadline = Instant::now() + timeout;
-        match tokio::time::timeout_at(deadline, provider.stream(req, deltas)).await {
+        match tokio::time::timeout_at(deadline, provider.stream_counting(req, deltas)).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => Err(finalize(err, 0)),
             Err(_elapsed) => Err(ModelError::Timeout(timeout)),
@@ -206,7 +207,7 @@ fn finalize(last: ModelError, attempts: u32) -> ModelError {
 mod tests {
     use super::*;
     use crate::mock::{MockProvider, ScriptedStep};
-    use crate::types::{FinishReason, Message, ToolCall};
+    use crate::types::{CompletionResponse, FinishReason, Message, ToolCall};
     use serde_json::json;
 
     fn req(provider: &str) -> CompletionRequest {
@@ -299,7 +300,7 @@ mod tests {
 
         let mut r = req("mock");
         r.retries = Some(3);
-        let response = gateway.complete(&r).await.unwrap();
+        let response = gateway.complete(&r).await.unwrap().response;
         match response {
             CompletionResponse::Finish { reason, text } => {
                 assert_eq!(reason, FinishReason::Stop);
@@ -368,7 +369,11 @@ mod tests {
         let (delta_tx, mut delta_rx) = crate::provider::delta_channel();
         let mut r = req("mock");
         r.retries = Some(3);
-        let response = gateway.complete_streaming(&r, &delta_tx).await.unwrap();
+        let response = gateway
+            .complete_streaming(&r, &delta_tx)
+            .await
+            .unwrap()
+            .response;
         drop(delta_tx);
 
         let mut streamed = String::new();
@@ -438,7 +443,7 @@ mod tests {
         ])]);
         let mut gateway = ModelGateway::new();
         gateway.register(Arc::new(provider)).unwrap();
-        let response = gateway.complete(&req("mock")).await.unwrap();
+        let response = gateway.complete(&req("mock")).await.unwrap().response;
         match response {
             CompletionResponse::ToolCalls(calls) => assert_eq!(calls.len(), 2),
             other => panic!("expected tool calls, got {other:?}"),

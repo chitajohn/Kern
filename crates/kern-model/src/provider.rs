@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::ModelError;
-use crate::types::{CompletionRequest, CompletionResponse};
+use crate::types::{Completion, CompletionRequest, CompletionResponse, Usage};
 
 /// Live delta sink: text fragments are pushed as they arrive.
 ///
@@ -39,6 +39,15 @@ pub trait ModelProvider: Send + Sync {
     /// quickly and never panic.
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ModelError>;
 
+    /// Usage-aware variant of [`ModelProvider::complete`].
+    ///
+    /// Adapters that parse a provider usage block override this; the default
+    /// reports no usage at all (`None` halves — not zeroes), so callers know to
+    /// estimate instead of trusting a fabricated count.
+    async fn complete_counting(&self, req: &CompletionRequest) -> Result<Completion, ModelError> {
+        Ok(Completion::new(self.complete(req).await?, Usage::default()))
+    }
+
     /// Stream one completion, delivering text fragments through `on_delta` as
     /// they arrive.
     ///
@@ -60,5 +69,17 @@ pub trait ModelProvider: Send + Sync {
             }
         }
         Ok(response)
+    }
+
+    /// Usage-aware variant of [`ModelProvider::stream`].
+    async fn stream_counting(
+        &self,
+        req: &CompletionRequest,
+        deltas: &DeltaSender,
+    ) -> Result<Completion, ModelError> {
+        Ok(Completion::new(
+            self.stream(req, deltas).await?,
+            Usage::default(),
+        ))
     }
 }

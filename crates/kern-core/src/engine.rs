@@ -28,7 +28,6 @@
 //!   ordering across calls is not preserved (§8.1.6e).
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,7 +48,8 @@ use crate::error::{ErrorCode, KernError, Result};
 use crate::event::payload::{self, ModelOutcomeKind};
 use crate::event::{EventBus, EventKind};
 use crate::lifecycle::Lifecycle;
-use crate::permissions::{Decision, Effect, FsAction, KeyAction, PermissionEngine};
+use crate::permissions::PermissionEngine;
+use crate::policy::CallDecision;
 use crate::store::model::{AgentMessage, Execution, PermissionStatus, ToolCall, ToolCallStatus};
 use crate::store::{ExecutionStatus, LifecycleState, Store};
 use crate::tasks::TaskRegistry;
@@ -151,6 +151,10 @@ pub struct Engine {
     lifecycle: Lifecycle,
     gateway: Arc<ModelGateway>,
     global_tools: Arc<Semaphore>,
+    /// Slots for concurrently running sub-agents (§35). Sizing this below the
+    /// global tool cap is what guarantees a child can always run its own
+    /// tools while its parent waits.
+    subagent_slots: Arc<Semaphore>,
     pub(crate) checkpoint: CheckpointManager,
     tasks: TaskRegistry,
     /// Graceful-shutdown signal; runners poll it at safe points.
@@ -175,6 +179,7 @@ impl Engine {
             bus,
             gateway,
             global_tools: Arc::new(Semaphore::new(global_tool_cap)),
+            subagent_slots: Arc::new(Semaphore::new((global_tool_cap / 2).max(1))),
             tasks: TaskRegistry::new(),
             shutdown,
             controls: Arc::new(Mutex::new(HashMap::new())),
@@ -190,6 +195,14 @@ impl Engine {
     /// The model gateway (tests register their provider here before running).
     pub fn gateway(&self) -> &ModelGateway {
         &self.gateway
+    }
+
+    /// Take one sub-agent slot (§35); held for the child's whole lifetime.
+    pub(crate) async fn acquire_subagent_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.subagent_slots)
+            .acquire_owned()
+            .await
+            .expect("sub-agent semaphore never closed")
     }
 
     pub fn is_running(&self, agent_id: &str) -> bool {
@@ -314,7 +327,8 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
+        let registry =
+            build_registry(&spec, Arc::clone(&self.store), &workspace, Some(self)).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -389,7 +403,8 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
+        let registry =
+            build_registry(&spec, Arc::clone(&self.store), &workspace, Some(self)).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -438,7 +453,8 @@ impl Engine {
             )
         })?;
         let workspace = workspace_dir(&self.store, &agent.name)?;
-        let registry = build_registry(&spec, Arc::clone(&self.store), &workspace).await?;
+        let registry =
+            build_registry(&spec, Arc::clone(&self.store), &workspace, Some(self)).await?;
         let executor = Arc::new(ToolExecutor::new(
             registry,
             Arc::clone(&self.global_tools),
@@ -448,6 +464,12 @@ impl Engine {
 
         let mut runner = self.build_runner(agent, spec, workspace, executor, permissions);
         runner.execution_id = execution_id.to_string();
+        // Token totals live on the execution row (durable per turn), so a
+        // resumed run continues its count instead of restarting it (§31).
+        let execution_id_owned = execution_id.to_string();
+        let store = Arc::clone(&self.store);
+        let execution =
+            store_blocking(store, move |s| s.get_execution(&execution_id_owned)).await?;
         runner.session = Session {
             messages: state.messages,
             history_trimmed: state.history_trimmed,
@@ -455,6 +477,9 @@ impl Engine {
             final_text: state.final_text,
             checkpoints: state.checkpoints,
             tool_calls: state.tool_calls,
+            compactions: 0,
+            input_tokens: execution.input_tokens,
+            output_tokens: execution.output_tokens,
             last_checkpoint_at: None,
         };
         runner.resumed = true;
@@ -479,7 +504,10 @@ impl Engine {
             "provider": spec.model.provider.as_str(),
             "model": spec.model.model,
         });
+        let memory =
+            crate::memory::build_provider(&spec.memory, Arc::clone(&self.store), &workspace);
         let tool_timeout = spec.runtime.tool_timeout().as_std();
+        let subagent_timeout = spec.runtime.subagent_timeout().as_std();
         let controls = self.controls_for(&agent.id);
         AgentRunner {
             store: Arc::clone(&self.store),
@@ -493,8 +521,10 @@ impl Engine {
             workspace,
             executor,
             permissions,
+            memory,
             session: Session::default(),
             tool_timeout,
+            subagent_timeout,
             deadline: None,
             runtime_meta,
             shutdown_rx: self.shutdown.subscribe(),
@@ -837,9 +867,108 @@ struct Session {
     /// Fresh tool calls issued so far in this execution (the execution budget;
     /// serialized into every checkpoint so a recovered run keeps its budget).
     tool_calls: u64,
+    /// How many times this run compacted its transcript (§7.5).
+    compactions: u64,
+    /// Cumulative prompt tokens for this execution (§31). Mirrored into the
+    /// `executions` row on every counted turn, and restored from it on resume.
+    input_tokens: u64,
+    /// Cumulative completion tokens for this execution (§31).
+    output_tokens: u64,
     /// When the last checkpoint was written (interval scheduling is per
     /// wall-clock, so this is deliberately NOT serialized).
     last_checkpoint_at: Option<Instant>,
+}
+
+impl Session {
+    /// Total tokens this execution has consumed.
+    fn tokens_used(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
+/// The text a turn is estimated from when the provider reported no usage:
+/// answer text, or the serialized arguments of requested tool calls.
+fn turn_text(response: &CompletionResponse) -> String {
+    match response {
+        CompletionResponse::Finish { text, .. } | CompletionResponse::Thinking(text) => {
+            text.clone()
+        }
+        CompletionResponse::ToolCalls(calls) => calls
+            .iter()
+            .map(|c| format!("{}({})", c.name, c.arguments))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// The model a call will use, after routing (§32).
+struct ModelRoute {
+    provider: String,
+    model: String,
+    max_tokens: Option<u32>,
+    temperature: f64,
+}
+
+/// Fold the compactable middle of `messages` into one deterministic digest
+/// message (§7.5).
+///
+/// Layout after compaction: `[task, digest, ...recent]`. Guarantees:
+/// - the initial task message is never folded away;
+/// - the kept tail starts at a non-`tool` message, so no tool result is
+///   orphaned from the assistant turn that requested it;
+/// - nothing is folded unless at least two messages would actually leave.
+///
+/// Returns whether anything changed.
+pub fn compact_messages(
+    messages: &mut Vec<Message>,
+    keep_recent: usize,
+    estimated_tokens: u64,
+    step: u64,
+) -> bool {
+    let keep_recent = keep_recent.max(2);
+    // `[task]` and the kept tail must both survive.
+    if messages.len() <= keep_recent + 2 {
+        return false;
+    }
+    let mut cut = messages.len() - keep_recent;
+    // Never start the tail on a tool result: its requesting assistant turn
+    // would be gone. Advancing is safe — it keeps more, never less.
+    while cut < messages.len() && messages[cut].role == kern_model::Role::Tool {
+        cut += 1;
+    }
+    if cut <= 1 {
+        return false;
+    }
+
+    const DIGEST_HEADER: &str = "[compacted transcript]\n";
+    const DIGEST_CAP: usize = 4_000;
+    let mut digest = format!(
+        "{DIGEST_HEADER}Earlier steps of this run were compacted at step {step} \
+         (~{estimated_tokens} estimated tokens). Summary of the {} removed message(s):\n",
+        cut - 1
+    );
+    for message in &messages[1..cut] {
+        if digest.len() >= DIGEST_CAP {
+            digest.push_str("- ...\n");
+            break;
+        }
+        let mut excerpt: String = message.content.chars().take(160).collect();
+        if !message.tool_calls.is_empty() {
+            let names: Vec<&str> = message.tool_calls.iter().map(|c| c.name.as_str()).collect();
+            excerpt.push_str(&format!(" [called: {}]", names.join(", ")));
+        }
+        excerpt = excerpt.replace('\n', " ");
+        digest.push_str(&format!("- {}: {excerpt}\n", message.role_str()));
+    }
+    if digest.len() > DIGEST_CAP {
+        digest.truncate(DIGEST_CAP);
+    }
+
+    let tail: Vec<Message> = messages.split_off(cut);
+    messages.truncate(1);
+    messages.push(Message::user(digest));
+    messages.extend(tail);
+    true
 }
 
 /// Bound `messages` to `max_history_tokens` using the §8.4 character
@@ -889,8 +1018,12 @@ struct AgentRunner {
     workspace: std::path::PathBuf,
     executor: Arc<ToolExecutor>,
     permissions: PermissionEngine,
+    /// The agent's memory backend (§34): store or file, per `memory.backend`.
+    memory: Arc<dyn kern_tool::MemoryProvider>,
     session: Session,
     tool_timeout: Duration,
+    /// Budget for one `agent.<name>` tool call (§35).
+    subagent_timeout: Duration,
     /// Monotonic wall-clock deadline for this execution
     /// (anchored to the persisted `started_at`; `None` = unbounded).
     deadline: Option<Instant>,
@@ -909,29 +1042,6 @@ struct AgentRunner {
     pending_calls: Vec<PendingCall>,
     /// Per-agent control flags (pause / manual checkpoint).
     controls: Arc<AgentControls>,
-}
-
-/// The §8.1 per-call classification.
-#[derive(Debug)]
-enum CallDecision {
-    Allow,
-    Ask,
-    Deny { reason: String },
-}
-
-/// The `host[:port]` form the permission engine matches against, with the
-/// default port filled from the URL scheme (so `https://api.github.com`
-/// becomes `api.github.com:443` and a `api.github.com:443` rule matches).
-/// Returns `None` for unparseable or host-less URLs. IPv6 literals keep
-/// host-only form: a v6+port request only matches port-less rules
-/// (fail-closed; documented limitation in ARCHITECTURE.md).
-fn http_host_port(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    let host = parsed.host_str()?;
-    match parsed.port_or_known_default() {
-        Some(port) if !host.contains(':') => Some(format!("{host}:{port}")),
-        _ => Some(host.to_string()),
-    }
 }
 
 impl AgentRunner {
@@ -1023,7 +1133,7 @@ impl AgentRunner {
                     }
                     RunControl::Continue => {}
                 }
-                self.trim_history();
+                self.trim_history().await?;
             }
         } else {
             self.lifecycle.start(&self.agent.id).await?;
@@ -1136,7 +1246,7 @@ impl AgentRunner {
                         }
                         RunControl::Continue => {}
                     }
-                    self.trim_history();
+                    self.trim_history().await?;
                 }
             }
         }
@@ -1297,8 +1407,9 @@ impl AgentRunner {
         })
     }
 
-    /// Build the completion request (§8.1.2): system prompt (+ memory digest
-    /// + durable variables) + bounded history + configured tool specs.
+    /// Build the completion request (§8.1.2): system prompt (plus memory
+    /// digest and durable variables), bounded history, configured tool specs,
+    /// and the routed model (§32).
     async fn build_request(&self) -> Result<CompletionRequest> {
         let mut messages = vec![Message::system(self.system_prompt().await?)];
         messages.extend(self.session.messages.iter().cloned());
@@ -1308,16 +1419,82 @@ impl AgentRunner {
             .specs(&self.spec.tools)
             .map_err(|e| tool_error_to_kern(&e))?;
 
+        let route = self.route();
         Ok(CompletionRequest {
-            provider: self.spec.model.provider.as_str().to_string(),
-            model: self.spec.model.model.clone(),
+            provider: route.provider,
+            model: route.model,
             messages,
             tools,
-            max_tokens: self.spec.model.max_tokens.map(|t| t as u32),
-            temperature: Some(self.spec.model.temperature),
+            max_tokens: route.max_tokens,
+            temperature: Some(route.temperature),
             timeout: self.spec.model.timeout.as_ref().map(|d| d.as_std()),
             retries: Some(self.spec.runtime.model_retries()),
         })
+    }
+
+    /// The effective model for the next call (§32): the first routing rule
+    /// whose conditions hold, else the spec's base model.
+    fn route(&self) -> ModelRoute {
+        let base = &self.spec.model;
+        let steps = self.session.steps;
+        let tokens = self.session.tokens_used();
+        for rule in &base.routing {
+            if rule.matches(steps, tokens) {
+                return ModelRoute {
+                    provider: rule.provider.as_str().to_string(),
+                    model: rule.model.clone(),
+                    max_tokens: rule.max_tokens.or(base.max_tokens).map(|t| t as u32),
+                    temperature: rule.temperature.unwrap_or(base.temperature),
+                };
+            }
+        }
+        ModelRoute {
+            provider: base.provider.as_str().to_string(),
+            model: base.model.clone(),
+            max_tokens: base.max_tokens.map(|t| t as u32),
+            temperature: base.temperature,
+        }
+    }
+
+    /// Fold the middle of the transcript into a deterministic digest once the
+    /// estimated prompt exceeds `runtime.compact_above_tokens` (§7.5).
+    ///
+    /// Compaction never calls the model: the digest is built from what the
+    /// session already recorded, so it is reproducible, cannot hallucinate, and
+    /// costs nothing. The initial task message and the most recent turns are
+    /// kept verbatim; the compacted region is checkpointed before the next
+    /// model call, so a crash replays the same prompt.
+    async fn compact_if_due(&mut self) -> Result<()> {
+        let Some(threshold) = self.spec.runtime.compact_above_tokens() else {
+            return Ok(());
+        };
+        let estimated =
+            kern_model::tokens::estimate_messages(&self.session.messages, &self.spec.model.model);
+        if estimated <= threshold {
+            return Ok(());
+        }
+        let keep = self.spec.runtime.compact_keep_recent() as usize;
+        let before = self.session.messages.len();
+        if !compact_messages(
+            &mut self.session.messages,
+            keep,
+            estimated,
+            self.session.steps,
+        ) {
+            return Ok(());
+        }
+        self.session.compactions += 1;
+        self.checkpoint_now("running", &[]).await?;
+        tracing::info!(
+            agent_id = %self.agent.id,
+            execution_id = %self.execution_id,
+            step = self.session.steps,
+            estimated_tokens = estimated,
+            messages_before = before,
+            messages_after = self.session.messages.len(),
+            "transcript compacted"
+        );
+        Ok(())
     }
 
     async fn system_prompt(&self) -> Result<String> {
@@ -1333,19 +1510,14 @@ impl AgentRunner {
              as messages. Never assume an action succeeded without a tool result.\n",
         );
         if self.spec.memory.enabled && self.spec.memory.inject_digest {
-            let store = Arc::clone(&self.store);
-            let agent_id = self.agent.id.clone();
-            let entries = store_blocking(store, move |s| s.memory_list(&agent_id, None)).await?;
-            prompt.push_str(&memory_digest(
-                &entries
-                    .into_iter()
-                    .map(|e| kern_tool::MemoryEntry {
-                        key: e.key,
-                        value: e.value,
-                        description: e.description,
-                    })
-                    .collect::<Vec<_>>(),
-            ));
+            // Read through the configured backend so a file-backed agent's
+            // digest reflects the file, not the (empty) store table.
+            let entries = self
+                .memory
+                .list(&self.agent.id, None)
+                .await
+                .map_err(|e| tool_error_to_kern(&e))?;
+            prompt.push_str(&memory_digest(&entries));
         }
         Ok(prompt)
     }
@@ -1361,11 +1533,7 @@ impl AgentRunner {
                 EventKind::ModelRequested,
                 Some(&self.agent.id),
                 Some(&self.execution_id),
-                payload::model_requested(
-                    self.spec.model.provider.as_str(),
-                    &self.spec.model.model,
-                    step,
-                ),
+                payload::model_requested(&request.provider, &request.model, step),
             )
             .await?;
         let started = Instant::now();
@@ -1377,8 +1545,8 @@ impl AgentRunner {
             let bus = self.bus.clone();
             let agent_id = self.agent.id.clone();
             let execution_id = self.execution_id.clone();
-            let provider = self.spec.model.provider.as_str().to_string();
-            let model = self.spec.model.model.clone();
+            let provider = request.provider.clone();
+            let model = request.model.clone();
             let forward = tokio::spawn(async move {
                 while let Some(text) = rx.recv().await {
                     bus.emit_transient(
@@ -1398,44 +1566,8 @@ impl AgentRunner {
         };
         let latency_ms = started.elapsed().as_millis() as u64;
 
-        match result {
-            Ok(CompletionResponse::Finish { reason, text }) => {
-                self.bus
-                    .emit(
-                        EventKind::ModelCompleted,
-                        Some(&self.agent.id),
-                        Some(&self.execution_id),
-                        payload::model_completed(
-                            self.spec.model.provider.as_str(),
-                            &self.spec.model.model,
-                            ModelOutcomeKind::Finish,
-                            latency_ms,
-                        ),
-                    )
-                    .await?;
-                Ok(CompletionResponse::Finish { reason, text })
-            }
-            Ok(CompletionResponse::Thinking(text)) => {
-                // The §6 catalog's model.completed kind is finish|tool_call,
-                // so a thinking turn emits only agent.thinking (§8.1.5).
-                Ok(CompletionResponse::Thinking(text))
-            }
-            Ok(CompletionResponse::ToolCalls(calls)) => {
-                self.bus
-                    .emit(
-                        EventKind::ModelCompleted,
-                        Some(&self.agent.id),
-                        Some(&self.execution_id),
-                        payload::model_completed(
-                            self.spec.model.provider.as_str(),
-                            &self.spec.model.model,
-                            ModelOutcomeKind::ToolCall,
-                            latency_ms,
-                        ),
-                    )
-                    .await?;
-                Ok(CompletionResponse::ToolCalls(calls))
-            }
+        let completion = match result {
+            Ok(completion) => completion,
             Err(err) => {
                 let kern = model_error_to_kern(&err);
                 self.bus
@@ -1446,9 +1578,94 @@ impl AgentRunner {
                         payload::model_failed(&kern),
                     )
                     .await?;
-                Err(kern)
+                return Err(kern);
+            }
+        };
+
+        // Token accounting (§31): the provider's own counts win; a missing
+        // half is estimated from the exact request/response we just used. The
+        // turn is counted BEFORE any state change, so a crash cannot lose
+        // tokens the provider already billed.
+        let outcome_text = turn_text(&completion.response);
+        let estimated = !completion.usage.is_complete();
+        let usage = completion
+            .usage
+            .or_estimate(kern_model::tokens::estimate_turn(&request, &outcome_text));
+        self.record_usage(usage).await?;
+
+        match completion.response {
+            CompletionResponse::Finish { reason, text } => {
+                self.emit_model_completed(
+                    &request,
+                    ModelOutcomeKind::Finish,
+                    latency_ms,
+                    usage,
+                    estimated,
+                )
+                .await?;
+                Ok(CompletionResponse::Finish { reason, text })
+            }
+            CompletionResponse::Thinking(text) => {
+                // The §6 catalog's model.completed kind is finish|tool_call,
+                // so a thinking turn emits only agent.thinking (§8.1.5).
+                Ok(CompletionResponse::Thinking(text))
+            }
+            CompletionResponse::ToolCalls(calls) => {
+                self.emit_model_completed(
+                    &request,
+                    ModelOutcomeKind::ToolCall,
+                    latency_ms,
+                    usage,
+                    estimated,
+                )
+                .await?;
+                Ok(CompletionResponse::ToolCalls(calls))
             }
         }
+    }
+
+    /// Add one turn's tokens to the session and the execution row.
+    async fn record_usage(&mut self, usage: kern_model::Usage) -> Result<()> {
+        let input = u64::from(usage.input_tokens.unwrap_or(0));
+        let output = u64::from(usage.output_tokens.unwrap_or(0));
+        if input == 0 && output == 0 {
+            return Ok(());
+        }
+        self.session.input_tokens += input;
+        self.session.output_tokens += output;
+        let store = Arc::clone(&self.store);
+        let execution_id = self.execution_id.clone();
+        store_blocking(store, move |s| {
+            s.add_execution_usage(&execution_id, input, output)
+        })
+        .await
+    }
+
+    async fn emit_model_completed(
+        &self,
+        request: &CompletionRequest,
+        kind: ModelOutcomeKind,
+        latency_ms: u64,
+        usage: kern_model::Usage,
+        estimated: bool,
+    ) -> Result<()> {
+        self.bus
+            .emit(
+                EventKind::ModelCompleted,
+                Some(&self.agent.id),
+                Some(&self.execution_id),
+                payload::model_completed_counted(
+                    &request.provider,
+                    &request.model,
+                    kind,
+                    latency_ms,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    estimated,
+                ),
+            )
+            .await
+            .map(|_| ())
     }
 
     // ------------------------------------------------------------------
@@ -1810,7 +2027,13 @@ impl AgentRunner {
                 let name = call.name.clone();
                 let args = call.arguments.clone();
                 let id = call.id.clone();
-                let timeout = self.tool_timeout;
+                // A delegation runs a whole child execution; it is bounded by
+                // `runtime.subagent_timeout`, not the per-command timeout.
+                let timeout = if name.starts_with("agent.") {
+                    self.subagent_timeout
+                } else {
+                    self.tool_timeout
+                };
                 set.spawn(async move {
                     let ctx = ToolContext {
                         agent_id: &agent_id,
@@ -1976,93 +2199,11 @@ impl AgentRunner {
             .map(|_| ())
     }
 
-    /// Classify a validated call against policy (§10). Returns the decision
-    /// plus the resource/action strings carried by events.
+    /// Classify a validated call against policy (§10). Delegates to the shared
+    /// classifier so the MCP serving surface applies identical rules.
     fn classify(&self, tool: &str, args: &Value) -> (CallDecision, String, String) {
-        let decide = |d: &Decision| match d.effect {
-            Effect::Allow => CallDecision::Allow,
-            Effect::Ask => CallDecision::Ask,
-            Effect::Deny => CallDecision::Deny {
-                reason: d.reason.clone(),
-            },
-        };
-        match tool {
-            "filesystem" => {
-                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                let is_write = action == "write";
-                let fs_action = if is_write {
-                    FsAction::Write
-                } else {
-                    FsAction::Read
-                };
-                let d = self.permissions.evaluate_path(Path::new(path), fs_action);
-                (
-                    decide(&d),
-                    path.to_string(),
-                    if is_write { "write" } else { "read" }.to_string(),
-                )
-            }
-            "http" => {
-                let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                match http_host_port(url) {
-                    Some(hostport) => {
-                        let d = self.permissions.evaluate_host(&hostport);
-                        (decide(&d), hostport, "network".to_string())
-                    }
-                    None => (
-                        CallDecision::Deny {
-                            reason: format!("invalid URL {url:?}"),
-                        },
-                        url.to_string(),
-                        "network".to_string(),
-                    ),
-                }
-            }
-            "memory.read" | "memory.list" => {
-                let key = args
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .or_else(|| args.get("prefix").and_then(Value::as_str))
-                    .unwrap_or("*");
-                let d = self.permissions.evaluate_key(key, KeyAction::Read);
-                (decide(&d), key.to_string(), "read".to_string())
-            }
-            "memory.write" => {
-                let key = args.get("key").and_then(Value::as_str).unwrap_or("");
-                let d = self.permissions.evaluate_key(key, KeyAction::Write);
-                (decide(&d), key.to_string(), "write".to_string())
-            }
-            "shell" => {
-                if self.permissions.shell_allowed() {
-                    (
-                        CallDecision::Allow,
-                        "shell".to_string(),
-                        "shell".to_string(),
-                    )
-                } else {
-                    (
-                        CallDecision::Deny {
-                            reason: "shell is disabled for this agent".to_string(),
-                        },
-                        "shell".to_string(),
-                        "shell".to_string(),
-                    )
-                }
-            }
-            _ if self.spec.mcp.is_mcp_tool(tool) => {
-                let d = self.permissions.evaluate_mcp(tool);
-                (decide(&d), tool.to_string(), "mcp".to_string())
-            }
-            "noop" | "sleep" => (CallDecision::Allow, tool.to_string(), "none".to_string()),
-            other => (
-                CallDecision::Deny {
-                    reason: format!("tool {other:?} is not configured for this agent"),
-                },
-                other.to_string(),
-                "none".to_string(),
-            ),
-        }
+        let c = crate::policy::classify(&self.spec, &self.permissions, tool, args);
+        (c.decision, c.resource, c.action)
     }
 
     /// Park until every ask request is decided (poll-based, crash-safe). A
@@ -2112,10 +2253,15 @@ impl AgentRunner {
         }
     }
 
-    fn trim_history(&mut self) {
+    /// Compact (if the configured threshold is crossed), then bound the
+    /// history. Compaction runs first so information that trim would silently
+    /// drop has already been folded into the digest.
+    async fn trim_history(&mut self) -> Result<()> {
+        self.compact_if_due().await?;
         let max_tokens = self.spec.runtime.max_history_tokens();
         let trimmed = trim_messages(&mut self.session.messages, max_tokens);
         self.session.history_trimmed |= trimmed;
+        Ok(())
     }
 }
 

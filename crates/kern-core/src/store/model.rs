@@ -221,6 +221,32 @@ pub struct Execution {
     /// daemon startup (missed wake collapses, like the scheduler's
     /// fire-and-advance).
     pub wake_at: Option<DateTime<Utc>>,
+    /// Cumulative prompt tokens for this execution (schema v6).
+    pub input_tokens: u64,
+    /// Cumulative completion tokens for this execution (schema v6).
+    pub output_tokens: u64,
+}
+
+impl Execution {
+    /// `(input, output)` token totals as reported/estimated for this run.
+    pub fn usage(&self) -> (u64, u64) {
+        (self.input_tokens, self.output_tokens)
+    }
+}
+
+/// Runtime-wide or per-agent token totals (ARCHITECTURE.md §31).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Executions that contributed at least one counted turn.
+    pub executions: u64,
+}
+
+impl UsageTotals {
+    pub fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
 }
 
 /// Delivery state of a mid-run operator message (schema v5, ARCHITECTURE §30).
@@ -284,6 +310,8 @@ impl Execution {
             latest_checkpoint_id: None,
             input: None,
             wake_at: None,
+            input_tokens: 0,
+            output_tokens: 0,
         }
     }
 }

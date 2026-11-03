@@ -15,7 +15,7 @@ mod doctor;
 mod init;
 mod table;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -118,6 +118,15 @@ enum Command {
     Tools,
     /// List registered model providers.
     Models,
+    /// Token usage totals (all agents, or one agent).
+    Usage {
+        /// Agent name or id.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Print the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
     /// List pending permission decisions.
     Permissions,
     /// Grant a pending permission request.
@@ -129,6 +138,30 @@ enum Command {
     Deny {
         /// Permission request id.
         request_id: String,
+    },
+    /// Serve an agent spec's tools over MCP (stdio) for other agents.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCommand,
+    },
+    /// Compact the event log, keeping the newest N events per agent.
+    Compact {
+        /// Events to retain per agent.
+        #[arg(long, default_value_t = 1000)]
+        per_agent: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Serve stateless tools (filesystem, http, shell, noop, sleep) on
+    /// stdin/stdout using MCP 2024-11-05.
+    Serve {
+        /// Path to an agent.yaml spec.
+        spec: PathBuf,
+        /// Workspace root for relative paths (default: the spec's directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -186,9 +219,14 @@ async fn dispatch(cli: Cli) -> Result<i32, String> {
         Command::Terminate { target } => cmd_lifecycle(&target, "terminate", "terminated").await,
         Command::Tools => cmd_tools().await,
         Command::Models => cmd_models().await,
+        Command::Usage { agent, json } => cmd_usage(agent.as_deref(), json).await,
         Command::Permissions => cmd_permissions().await,
         Command::Grant { request_id } => cmd_decide(&request_id, true).await,
         Command::Deny { request_id } => cmd_decide(&request_id, false).await,
+        Command::Mcp { action } => match action {
+            McpCommand::Serve { spec, workspace } => cmd_mcp_serve(&spec, workspace).await,
+        },
+        Command::Compact { per_agent } => cmd_compact(per_agent).await,
     }
 }
 
@@ -568,6 +606,97 @@ async fn cmd_tools() -> Result<i32, String> {
         .collect();
     table::print_table(&["NAME", "PERMISSION", "DESCRIPTION"], &rows);
     Ok(0)
+}
+
+async fn cmd_mcp_serve(spec_path: &Path, workspace: Option<PathBuf>) -> Result<i32, String> {
+    let yaml = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("read {}: {e}", spec_path.display()))?;
+    let spec = kern_core::config::parse_agent_spec(&yaml).map_err(|e| e.to_string())?;
+    let workspace = workspace.unwrap_or_else(|| {
+        spec_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    kern_core::mcp_server::serve_stdio(&spec, &workspace)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+async fn cmd_compact(per_agent: usize) -> Result<i32, String> {
+    if per_agent == 0 {
+        return Err("--per-agent must be positive".to_string());
+    }
+    let client = Client::from_env().map_err(|e| e.to_string())?;
+    let result = client
+        .compact_events(per_agent)
+        .await
+        .map_err(display_client)?;
+    println!(
+        "pruned {} event(s), keeping the newest {per_agent} per agent",
+        result["pruned"].as_u64().unwrap_or(0)
+    );
+    Ok(0)
+}
+
+async fn cmd_usage(agent: Option<&str>, json: bool) -> Result<i32, String> {
+    let client = Client::from_env().map_err(|e| e.to_string())?;
+    let mut usage = client.usage().await.map_err(display_client)?;
+    if let Some(target) = agent {
+        let id = client.resolve_agent(target).await.map_err(display_client)?;
+        let row = usage["agents"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|r| r["agent_id"].as_str() == Some(id.as_str()))
+                    .cloned()
+            })
+            .unwrap_or_else(|| serde_json::json!({ "name": target, "input_tokens": 0, "output_tokens": 0, "executions": 0 }));
+        usage = row;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&usage).map_err(|e| e.to_string())?
+        );
+        return Ok(0);
+    }
+    if agent.is_some() {
+        let rows = vec![usage_row(&usage)];
+        table::print_table(&["NAME", "INPUT", "OUTPUT", "TOTAL", "EXECUTIONS"], &rows);
+        return Ok(0);
+    }
+    let rows: Vec<Vec<String>> = usage["agents"]
+        .as_array()
+        .map(|agents| agents.iter().map(usage_row).collect())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("no agents yet");
+    } else {
+        table::print_table(&["NAME", "INPUT", "OUTPUT", "TOTAL", "EXECUTIONS"], &rows);
+    }
+    println!(
+        "\ntotal: {} input + {} output = {} tokens across {} execution(s)",
+        usage["input_tokens"].as_u64().unwrap_or(0),
+        usage["output_tokens"].as_u64().unwrap_or(0),
+        usage["total_tokens"].as_u64().unwrap_or(0),
+        usage["executions"].as_u64().unwrap_or(0),
+    );
+    Ok(0)
+}
+
+fn usage_row(entry: &serde_json::Value) -> Vec<String> {
+    let input = entry["input_tokens"].as_u64().unwrap_or(0);
+    let output = entry["output_tokens"].as_u64().unwrap_or(0);
+    vec![
+        entry["name"].as_str().unwrap_or("?").to_string(),
+        input.to_string(),
+        output.to_string(),
+        (input + output).to_string(),
+        entry["executions"].as_u64().unwrap_or(0).to_string(),
+    ]
 }
 
 async fn cmd_models() -> Result<i32, String> {

@@ -191,6 +191,170 @@ pub struct AgentSpec {
     pub schedule: Option<ScheduleConfig>,
     #[serde(default)]
     pub runtime: AgentRuntime,
+    /// Agents this agent may call as tools (`agent.<name>`, ARCHITECTURE.md
+    /// §35). A sub-agent is a real execution with its own id, workspace,
+    /// checkpoint history, and budgets — not an in-process pretense — and its
+    /// capability set is a subset of its parent's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentConfig>,
+    /// Secrets injected into specific tool surfaces (ARCHITECTURE.md §33).
+    /// Values are resolved from the daemon environment at agent start and are
+    /// never persisted, logged, or shown to the model — only handed to the
+    /// tool that was granted them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<CredentialConfig>,
+}
+
+/// Where a credential may be used (§33). A credential must name at least one
+/// target; it is never injected anywhere implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialTarget {
+    /// As an environment variable for `shell` subprocesses.
+    Shell,
+    /// As an HTTP header value for the `http` tool.
+    Http,
+    /// As an environment variable for every MCP server the agent uses.
+    Mcp,
+}
+
+impl CredentialTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialTarget::Shell => "shell",
+            CredentialTarget::Http => "http",
+            CredentialTarget::Mcp => "mcp",
+        }
+    }
+}
+
+impl std::str::FromStr for CredentialTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "shell" => Ok(CredentialTarget::Shell),
+            "http" => Ok(CredentialTarget::Http),
+            "mcp" => Ok(CredentialTarget::Mcp),
+            other => Err(format!(
+                "unknown credential target {other:?} (expected shell|http|mcp)"
+            )),
+        }
+    }
+}
+
+/// One sub-agent definition (`subagents[]`, ARCHITECTURE.md §35).
+///
+/// There is deliberately no `subagents` field here: nesting is not allowed, so
+/// the call graph is exactly one level deep and a fan-out cannot recurse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentConfig {
+    /// Slug used in the tool name `agent.<name>`.
+    pub name: String,
+    /// What the parent's model reads to decide when to delegate.
+    pub description: String,
+    /// The child's tool list. Must be a subset of the parent's tools.
+    pub tools: Vec<String>,
+    /// Child step budget (default: the parent's `runtime.max_steps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+    /// Child wall-clock budget (default: the parent's `runtime.max_duration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<Duration>,
+    /// Optional model override; defaults to the parent's model block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelConfig>,
+}
+
+/// One credential grant (§33).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialConfig {
+    /// The variable/header name. For `shell`/`mcp` this is the env var name
+    /// (uppercase); for `http` it may be a header name (`Authorization`).
+    pub name: String,
+    /// Source value: `env:VAR` (resolved at agent start) or a literal.
+    pub from: String,
+    /// Targets this credential is injected into. Defaults to `[shell]` — the
+    /// narrowest useful grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// `http` only: the header to set (default `Authorization`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// `http` only: prefix for the header value (e.g. `Bearer `).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+impl CredentialConfig {
+    /// The resolved targets (default `[shell]`).
+    pub fn targets(&self) -> Result<Vec<CredentialTarget>> {
+        if self.tools.is_empty() {
+            return Ok(vec![CredentialTarget::Shell]);
+        }
+        let mut out = Vec::with_capacity(self.tools.len());
+        for tool in &self.tools {
+            out.push(
+                tool.parse::<CredentialTarget>()
+                    .map_err(|e| invalid("credentials", format!("{}: {e}", self.name)))?,
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// A credential resolved for use at agent start. The value is `exclude`d from
+/// Debug so it cannot leak through a log line or a panic message.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedCredential {
+    pub name: String,
+    pub value: String,
+    pub targets: Vec<CredentialTarget>,
+    pub header: Option<String>,
+    pub prefix: Option<String>,
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("targets", &self.targets)
+            .field("header", &self.header)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+impl ResolvedCredential {
+    /// `VAR=value` pairs for the shell tool.
+    pub fn shell_env(&self) -> Option<(String, String)> {
+        self.targets
+            .contains(&CredentialTarget::Shell)
+            .then(|| (self.name.clone(), self.value.clone()))
+    }
+
+    /// `(header, value)` for the http tool, when granted.
+    pub fn http_header(&self) -> Option<(String, String)> {
+        if !self.targets.contains(&CredentialTarget::Http) {
+            return None;
+        }
+        let header = self
+            .header
+            .clone()
+            .unwrap_or_else(|| "Authorization".into());
+        let value = format!("{}{}", self.prefix.clone().unwrap_or_default(), self.value);
+        Some((header, value))
+    }
+
+    /// `VAR=value` pairs for MCP servers, when granted.
+    pub fn mcp_env(&self) -> Option<(String, String)> {
+        self.targets
+            .contains(&CredentialTarget::Mcp)
+            .then(|| (self.name.clone(), self.value.clone()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -207,10 +371,79 @@ pub struct ModelConfig {
     /// Provider base URL; may be an `env:VAR` reference (resolved at use time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Ordered routing rules (ARCHITECTURE.md §32). The first rule whose
+    /// conditions all hold wins for that call; otherwise `provider`/`model`
+    /// above are used. Routing is evaluated per model call, so a long run can
+    /// escalate without restarting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing: Vec<RoutingRule>,
+}
+
+/// One model-routing rule (§32). Every present condition must hold (`AND`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRule {
+    /// Match once the run has completed more than this many steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_step_above: Option<u32>,
+    /// Match once the run has consumed more than this many tokens (reported or
+    /// estimated, cumulative for the execution).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_tokens_above: Option<u64>,
+    pub provider: Provider,
+    pub model: String,
+    /// Override `model.max_tokens` for calls matching this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Override `model.temperature` for calls matching this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+impl RoutingRule {
+    /// Whether this rule matches the run's current position.
+    pub fn matches(&self, steps: u64, tokens_used: u64) -> bool {
+        if self.if_step_above.is_none() && self.if_tokens_above.is_none() {
+            // An unconditional rule: always matches (validation allows it so a
+            // trailing fallback can pin a different provider).
+            return true;
+        }
+        if let Some(step) = self.if_step_above {
+            if steps <= u64::from(step) {
+                return false;
+            }
+        }
+        if let Some(tokens) = self.if_tokens_above {
+            if tokens_used <= tokens {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 fn default_temperature() -> f64 {
     0.0
+}
+
+/// Where an agent's memory lives (`memory.backend`, ARCHITECTURE.md §34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryBackend {
+    /// Agent-scoped rows in the runtime's SQLite store (default).
+    #[default]
+    Store,
+    /// A JSON file inside the agent workspace.
+    File,
+}
+
+impl MemoryBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryBackend::Store => "store",
+            MemoryBackend::File => "file",
+        }
+    }
 }
 
 /// `memory:` block (`SPEC.md §9`). Exposes `memory.read/write/list` tools.
@@ -223,6 +456,12 @@ pub struct MemoryConfig {
     pub max_keys: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_value_bytes: Option<u64>,
+    /// Storage backend (default `store`).
+    pub backend: MemoryBackend,
+    /// `file` backend only: directory inside the agent workspace
+    /// (default `.kern/memory`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// `permissions:` block. Absence of a rule class means no access (default deny).
@@ -502,6 +741,18 @@ pub struct AgentRuntime {
     /// Default false — v0.1 turn semantics, no provider stream dependency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Compact the transcript once the estimated prompt exceeds this many
+    /// tokens (ARCHITECTURE.md §7.5). Unset/`0` disables compaction, leaving
+    /// the trim-only behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_above_tokens: Option<u64>,
+    /// Messages kept verbatim at the tail when compacting (default 6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_keep_recent: Option<u32>,
+    /// Budget for one `agent.<name>` delegation (default 300s). A delegation
+    /// runs a whole child execution, so it is NOT bounded by `tool_timeout`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_timeout: Option<Duration>,
 }
 
 impl AgentRuntime {
@@ -578,6 +829,23 @@ impl AgentRuntime {
     /// Per-execution tool-call budget (`0`/unset = unbounded).
     pub fn max_tool_calls(&self) -> Option<u32> {
         self.max_tool_calls.filter(|n| *n > 0)
+    }
+
+    /// Compact the transcript above this estimated prompt size (`0`/unset =
+    /// disabled).
+    pub fn compact_above_tokens(&self) -> Option<u64> {
+        self.compact_above_tokens.filter(|n| *n > 0)
+    }
+
+    /// Messages kept verbatim at the tail when compacting (default 6).
+    pub fn compact_keep_recent(&self) -> u32 {
+        self.compact_keep_recent.unwrap_or(6).max(2)
+    }
+
+    /// Budget for one sub-agent delegation (default 300s).
+    pub fn subagent_timeout(&self) -> Duration {
+        self.subagent_timeout
+            .unwrap_or_else(|| Duration::parse("300s").expect("const"))
     }
 }
 
@@ -657,10 +925,45 @@ impl AgentSpec {
                 return Err(invalid("model.base_url", "must not be empty"));
             }
         }
+        if self.model.model.trim().is_empty() {
+            return Err(invalid("model.model", "must not be empty"));
+        }
+        for (index, rule) in self.model.routing.iter().enumerate() {
+            let field = format!("model.routing[{index}]");
+            if rule.model.trim().is_empty() {
+                return Err(invalid(&field, "model must not be empty"));
+            }
+            if let Some(max) = rule.max_tokens {
+                if max == 0 {
+                    return Err(invalid(&field, "max_tokens must be positive"));
+                }
+            }
+            if let Some(t) = rule.temperature {
+                if !(0.0..=2.0).contains(&t) {
+                    return Err(invalid(&field, "temperature must be between 0 and 2"));
+                }
+            }
+            if rule.if_step_above.is_none() && rule.if_tokens_above.is_none() {
+                // Allowed, but only as the LAST rule: an unconditional rule
+                // anywhere else would make every later rule unreachable.
+                if index + 1 != self.model.routing.len() {
+                    return Err(invalid(
+                        &field,
+                        "a rule with no conditions must be the last rule",
+                    ));
+                }
+            }
+        }
 
         // Tools: known builtin names, or `<server>.<tool>` for a configured
         // MCP server; tool class gates from §9.
+        self.validate_subagents()?;
+
         for tool in &self.tools {
+            // Sub-agent tools were validated (and their targets exist) above.
+            if tool.starts_with("agent.") {
+                continue;
+            }
             if KNOWN_TOOLS.contains(&tool.as_str()) {
                 if tool.starts_with("memory.") && !self.memory.enabled {
                     return Err(invalid(
@@ -693,6 +996,8 @@ impl AgentSpec {
                 ));
             }
         }
+        self.validate_credentials()?;
+
         self.mcp.validate()?;
 
         self.memory.validate()?;
@@ -704,8 +1009,187 @@ impl AgentSpec {
     }
 }
 
+impl AgentSpec {
+    /// Sub-agent definitions (§35): unique slugs, subset capability sets, and
+    /// no nesting.
+    fn validate_subagents(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for tool in &self.tools {
+            if let Some(name) = tool.strip_prefix("agent.") {
+                if !self.subagents.iter().any(|s| s.name == name) {
+                    return Err(invalid(
+                        "tools",
+                        format!(
+                            "tool {tool:?} names a sub-agent that is not declared in `subagents`"
+                        ),
+                    ));
+                }
+            }
+        }
+        for (index, sub) in self.subagents.iter().enumerate() {
+            let field = format!("subagents[{index}]");
+            if !valid_slug(&sub.name) {
+                return Err(invalid(
+                    &field,
+                    format!(
+                        "invalid sub-agent name {:?}: must match [a-z0-9][a-z0-9-_]*",
+                        sub.name
+                    ),
+                ));
+            }
+            if !seen.insert(sub.name.as_str()) {
+                return Err(invalid(
+                    &field,
+                    format!("duplicate sub-agent name {:?}", sub.name),
+                ));
+            }
+            if sub.description.trim().is_empty() {
+                return Err(invalid(&field, "description must not be empty"));
+            }
+            if sub.tools.is_empty() {
+                return Err(invalid(&field, "at least one tool is required"));
+            }
+            if sub.max_steps == Some(0) {
+                return Err(invalid(&field, "max_steps must be positive"));
+            }
+            if let Some(d) = sub.max_duration {
+                if d.as_millis() == 0 {
+                    return Err(invalid(&field, "max_duration must be positive"));
+                }
+            }
+            if let Some(model) = &sub.model {
+                if model.model.trim().is_empty() {
+                    return Err(invalid(&field, "model.model must not be empty"));
+                }
+                if !(0.0..=2.0).contains(&model.temperature) {
+                    return Err(invalid(&field, "model.temperature must be between 0 and 2"));
+                }
+                if model.max_tokens == Some(0) {
+                    return Err(invalid(&field, "model.max_tokens must be positive"));
+                }
+            }
+            for tool in &sub.tools {
+                if tool.starts_with("agent.") {
+                    return Err(invalid(
+                        &field,
+                        "sub-agents cannot declare sub-agents (nesting is not supported)",
+                    ));
+                }
+                if !self.tools.contains(tool) {
+                    return Err(invalid(
+                        &field,
+                        format!(
+                            "tool {tool:?} must also be in the parent's `tools` \
+                             (a sub-agent cannot exceed its parent's capabilities)"
+                        ),
+                    ));
+                }
+                if tool.starts_with("memory.") && !self.memory.enabled {
+                    return Err(invalid(
+                        &field,
+                        format!("tool {tool:?} requires memory.enabled: true"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Credential grants: names, sources, and targets (§33).
+    fn validate_credentials(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (index, cred) in self.credentials.iter().enumerate() {
+            let field = format!("credentials[{index}]");
+            if cred.name.trim().is_empty() {
+                return Err(invalid(&field, "name must not be empty"));
+            }
+            if !seen.insert(cred.name.as_str()) {
+                return Err(invalid(
+                    &field,
+                    format!("duplicate credential name {:?}", cred.name),
+                ));
+            }
+            let targets = cred.targets()?;
+            if let Some(rest) = cred.from.strip_prefix("env:") {
+                validate_env_ref_name(&field, rest)?;
+            } else if cred.from.is_empty() {
+                return Err(invalid(&field, "from must not be empty"));
+            }
+            let has_http = targets.contains(&CredentialTarget::Http);
+            if cred.header.is_some() && !has_http {
+                return Err(invalid(&field, "header requires \"http\" in tools"));
+            }
+            if cred.prefix.is_some() && !has_http {
+                return Err(invalid(&field, "prefix requires \"http\" in tools"));
+            }
+            // Env-style targets must be valid variable names, so a grant cannot
+            // smuggle an assignment or a newline into a child environment.
+            for target in &targets {
+                if matches!(target, CredentialTarget::Shell | CredentialTarget::Mcp) {
+                    let valid = !cred.name.is_empty()
+                        && cred
+                            .name
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                        && !cred.name.starts_with(|c: char| c.is_ascii_digit());
+                    if !valid {
+                        return Err(invalid(
+                            &field,
+                            format!(
+                                "name {:?} must be an uppercase environment variable name",
+                                cred.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve every credential's value from the daemon environment (§33).
+    ///
+    /// Fails closed: an unset `env:` source fails the agent's start rather than
+    /// injecting an empty secret or silently skipping the grant.
+    pub fn resolve_credentials(&self) -> Result<Vec<ResolvedCredential>> {
+        let mut out = Vec::with_capacity(self.credentials.len());
+        for cred in &self.credentials {
+            let value = resolve_env_ref(&cred.from)?;
+            out.push(ResolvedCredential {
+                name: cred.name.clone(),
+                value,
+                targets: cred.targets()?,
+                header: cred.header.clone(),
+                prefix: cred.prefix.clone(),
+            });
+        }
+        Ok(out)
+    }
+}
+
 impl MemoryConfig {
     fn validate(&self) -> Result<()> {
+        if let Some(dir) = &self.dir {
+            if dir.trim().is_empty() {
+                return Err(invalid("memory.dir", "must not be empty"));
+            }
+            let path = std::path::Path::new(dir);
+            if path.is_absolute() {
+                return Err(invalid(
+                    "memory.dir",
+                    "must be relative to the agent workspace",
+                ));
+            }
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(invalid(
+                    "memory.dir",
+                    "must not contain '..' (it stays inside the agent workspace)",
+                ));
+            }
+        }
         for (field, value) in [
             ("memory.max_keys", self.max_keys),
             ("memory.max_value_bytes", self.max_value_bytes),

@@ -186,6 +186,28 @@ pub fn model_completed(
     })
 }
 
+/// `model.completed` with token accounting attached (ARCHITECTURE.md §31).
+///
+/// `input_tokens`/`output_tokens` are `None` when neither the provider nor the
+/// estimator could produce a count; `estimated` says which source won.
+pub fn model_completed_counted(
+    provider: &str,
+    model: &str,
+    kind: ModelOutcomeKind,
+    latency_ms: u64,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    estimated: bool,
+) -> Value {
+    let mut payload = model_completed(provider, model, kind, latency_ms);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("input_tokens".into(), json!(input_tokens));
+        map.insert("output_tokens".into(), json!(output_tokens));
+        map.insert("estimated".into(), json!(estimated));
+    }
+    payload
+}
+
 pub fn model_failed(error: &KernError) -> Value {
     json!({ "error": error_payload(error) })
 }
