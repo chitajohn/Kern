@@ -277,7 +277,11 @@ fn full_cli_flow_against_live_daemon() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("all checks passed"));
 
     let version = env.kern_stdout(&["version"]);
-    assert!(version.contains("kern 0.1.0"), "version: {version}");
+    let expected = format!("kern {}", env!("CARGO_PKG_VERSION"));
+    assert!(
+        version.contains(&expected),
+        "version should report {expected}: {version}"
+    );
     assert!(
         version.contains("daemon kern"),
         "version should report the daemon: {version}"
