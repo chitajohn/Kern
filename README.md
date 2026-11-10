@@ -3,9 +3,10 @@
 **The open-source runtime for reliable, long-running AI agents.**
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="Version">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
-  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status">
+  <a href="https://github.com/chitajohn/Kern/releases"><img src="https://img.shields.io/github/v/release/chitajohn/Kern?display_name=tag&sort=semver" alt="Release"></a>
+  <a href="https://github.com/chitajohn/Kern/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/chitajohn/Kern/ci.yml?branch=main&label=CI" alt="CI"></a>
+  <a href="https://crates.io/crates/kern-runtime"><img src="https://img.shields.io/crates/v/kern-runtime?label=crates.io" alt="crates.io"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/chitajohn/Kern" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="MSRV">
 </p>
 
