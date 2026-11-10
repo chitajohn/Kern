@@ -76,7 +76,7 @@ database.
   stateless tools over MCP stdio (`kern mcp serve`).
 - **Scheduling.** Interval, cron, or one-shot `at`, with crash-safe scheduling state.
 
----
+--
 
 ## Install
 
