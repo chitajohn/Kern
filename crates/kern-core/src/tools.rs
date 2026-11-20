@@ -668,11 +668,13 @@ mod tests {
         ) else {
             return true; // no backend: the real-process test cannot run
         };
-        matches!(
-            tool.run(&json!({ "command": "true" }), &tool_ctx())
-                .await,
-            Err(e) if e.to_string().contains("Operation not permitted")
-        )
+        match tool.run(&json!({ "command": "true" }), &tool_ctx()).await {
+            Err(e) => {
+                let message = e.to_string();
+                message.contains("Operation not permitted") || message.contains("failed to start")
+            }
+            Ok(_) => false,
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -780,6 +780,14 @@ that knob there is no memory cap (the default); per-execution cgroup accounting 
   (defense in depth), independent of the OS backend.
 - The exact capabilities of each backend MUST be documented in the README; we do not claim
   stronger boundaries than enforced.
+- `bwrap` has no rlimit options of its own: any `--rlimit…` spelling exits with
+  `Unknown option` before the command runs. The runtime therefore applies the caps **inside**
+  the sandbox — the payload is `sh -c 'ulimit -t …; ulimit -f …; ulimit -n …; [ulimit -v …;]
+  exec "$@"'` — so the boundary works with every `bwrap` build, and the sandboxed command
+  cannot raise the limits back (`exec` preserves them).
+- A sandbox wrapper that exits before the command runs (e.g. `bwrap: Unknown option …`, or a
+  spawn the host refuses) MUST fail the tool call with `SANDBOX_FAILURE` — never return an
+  empty successful result.
 
 ---
 

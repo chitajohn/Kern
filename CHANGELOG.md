@@ -3,6 +3,23 @@
 All notable changes to Kern. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Sandbox: resource limits no longer rely on `bwrap` flags.** Bubblewrap has no rlimit
+  options — every `--rlimit…` spelling exits with `Unknown option`, so the caps Kern thought it
+  was applying never took effect on a working `bwrap`, and made it refuse to start on some
+  builds. The limits are now applied inside the sandbox by a `sh -c 'ulimit …; exec "$@"'`
+  payload: the boundary works with any `bwrap`, and the sandboxed command cannot raise the
+  limits back.
+- **A sandbox wrapper that fails to start is now an error, not an empty result.** When `bwrap` (or
+  `sandbox-exec`) exits before running the command, the tool call fails with
+  `SANDBOX_FAILURE`/`bwrap failed to start: …` instead of returning an empty successful output that
+  looked like a command which ran and printed nothing. Host-restricted CI runners (no user
+  namespaces, child-side `setrlimit` refused) surfaced this: eight sandbox tests "failed" with empty
+  stdout while the sandbox had never started.
+
 ## [0.3.0] — 2026-11-03
 
 ### Added

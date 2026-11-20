@@ -118,6 +118,38 @@ impl LinuxBwrap {
         self.memory_bytes = bytes;
         self
     }
+
+    /// The payload that runs inside the sandbox: lower the rlimits with the
+    /// shell's `ulimit`, then `exec` the real command.
+    ///
+    /// `bwrap` itself has no rlimit options — `--rlimit…` in any spelling is
+    /// answered with `Unknown option` and makes it exit before running
+    /// anything (true for the manual and for the 0.9 build Ubuntu ships). The
+    /// caps therefore ride in the payload: lowering a limit is always
+    /// permitted, limits survive `exec`, and the sandboxed command cannot
+    /// raise them back. `ulimit -f` counts 512-byte blocks to stay within the
+    /// configured file size whatever shell `/bin/sh` is; `-v` is KiB, `-t`
+    /// seconds, `-n` descriptors.
+    fn payload(&self, program: &OsStr, args: &[OsString]) -> Vec<OsString> {
+        let fsize_blocks = self.fsize_bytes.div_ceil(512);
+        let mut script = format!(
+            "ulimit -t {}; ulimit -f {}; ulimit -n 256;",
+            self.cpu_seconds, fsize_blocks
+        );
+        if let Some(bytes) = self.memory_bytes {
+            script.push_str(&format!(" ulimit -v {};", bytes / 1024));
+        }
+        script.push_str(" exec \"$@\"");
+        let mut payload = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("kern-ulimit"),
+            program.to_os_string(),
+        ];
+        payload.extend(args.iter().cloned());
+        payload
+    }
 }
 
 impl Sandbox for LinuxBwrap {
@@ -127,7 +159,8 @@ impl Sandbox for LinuxBwrap {
 
     fn capability(&self) -> &'static str {
         "namespaces (net/pid/mount/ipc/uts), read-only root, writable workspace, \
-         rlimits, dropped capabilities, die-with-parent; no seccomp filter in v0.1"
+         rlimits (applied inside the sandbox), dropped capabilities, \
+         die-with-parent; no seccomp filter in v0.1"
     }
 
     fn wrap(
@@ -163,24 +196,9 @@ impl Sandbox for LinuxBwrap {
             workspace.into(),
             "--cap-drop".into(),
             "ALL".into(),
-            "--rlimit".into(),
-            "NOFILE".into(),
-            "256".into(),
-            "--rlimit".into(),
-            "FSIZE".into(),
-            self.fsize_bytes.to_string().into(),
-            "--rlimit".into(),
-            "CPU".into(),
-            self.cpu_seconds.to_string().into(),
         ];
-        if let Some(bytes) = self.memory_bytes {
-            wrapper.push("--rlimit".into());
-            wrapper.push("AS".into());
-            wrapper.push(bytes.to_string().into());
-        }
         wrapper.push("--".into());
-        wrapper.push(program.to_os_string());
-        wrapper.extend(args.iter().cloned());
+        wrapper.extend(self.payload(program, args));
         Ok((OsString::from("bwrap"), wrapper))
     }
 }
@@ -830,11 +848,19 @@ impl SandboxedRunner {
 #[async_trait]
 impl CommandRunner for SandboxedRunner {
     async fn run_command(&self, req: CommandRequest) -> Result<CommandOutput, ToolError> {
-        let (program, args) = shell_spec(&req.command);
+        let (child, child_args) = shell_spec(&req.command);
         let (program, args) = self
             .sandbox
-            .wrap(&program, &args)
+            .wrap(&child, &child_args)
             .map_err(|e| ToolError::Failed(format!("{}: {e}", self.sandbox.name())))?;
+        // A wrapped run may fail before the command ever starts; `spawn`
+        // reports what to look for in its output.
+        let wrapped = program != child;
+        let wrapper = if wrapped {
+            Some(program.to_string_lossy().into_owned())
+        } else {
+            None
+        };
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args);
         if let Some(cwd) = req.cwd {
@@ -853,8 +879,37 @@ impl CommandRunner for SandboxedRunner {
         self.sandbox
             .prepare_child(cmd.as_std_mut())
             .map_err(|e| ToolError::Failed(format!("{}: {e}", self.sandbox.name())))?;
-        kern_tool::process::run_captured(cmd, &self.limits).await
+        let output = kern_tool::process::run_captured(cmd, &self.limits).await?;
+        if let Some(wrapper) = wrapper {
+            if let Some(message) = wrapper_startup_failure(&wrapper, &output) {
+                return Err(ToolError::Failed(message));
+            }
+        }
+        Ok(output)
     }
+}
+
+/// A sandbox wrapper that cannot start never runs the command: `bwrap` (and
+/// `sandbox-exec`) print `"<program>: …"` on stderr and exit non-zero with
+/// nothing on stdout. Reporting that as an ordinary `CommandOutput` would turn
+/// a broken sandbox into silent empty results — the shell would look like it
+/// ran and said nothing — so it fails the tool call instead (SPEC §12: a
+/// sandbox that cannot be applied must not degrade silently).
+fn wrapper_startup_failure(wrapper: &str, output: &CommandOutput) -> Option<String> {
+    if output.code == Some(0) || !output.stdout.is_empty() {
+        return None;
+    }
+    let prefix = format!("{wrapper}: ");
+    let startup_error = output
+        .stderr
+        .lines()
+        .any(|line| line.trim_start().starts_with(&prefix));
+    startup_error.then(|| {
+        format!(
+            "{wrapper} failed to start: {}",
+            output.stderr.trim().replace('\n', "; ")
+        )
+    })
 }
 
 /// Non-secret variables allowed into tool subprocess environments. Provider
@@ -911,45 +966,38 @@ mod tests {
 
     /// GitHub-hosted runners deny child-side `setrlimit`/Landlock syscalls
     /// (their sandbox returns EPERM at spawn), so kernel-enforced behavior
-    /// cannot be exercised there. Probe the host once per test: when sandbox
-    /// spawns are refused, the real-process tests skip with a message — on
-    /// any host that permits them (local dev, self-hosted runners) the full
-    /// contract is asserted. The runtime itself still fails closed on such
-    /// hosts (a sandbox that cannot be applied must not degrade silently);
-    /// only the tests are environment-aware.
+    /// cannot be exercised there. Probe the *exact backend* a test is about
+    /// to use with the cheapest command it can run (`true`): the tiers are
+    /// refused independently — a host can run `bwrap` and refuse the Landlock
+    /// pre-exec — so one shared probe would let a test reach a backend the
+    /// host does not permit. When the probe is refused the real-process test
+    /// skips with a message; on any host that permits it (local dev,
+    /// self-hosted runners) the full contract is asserted. The runtime itself
+    /// still fails closed on such hosts (a sandbox that cannot be applied must
+    /// not degrade silently); only the tests are environment-aware.
     #[cfg(unix)]
-    async fn host_denies_sandbox_spawn() -> bool {
-        let dir = tempfile::tempdir().unwrap();
-        let Ok(sandbox) = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
-        else {
-            return true; // no backend at all: real-process tests cannot run
-        };
+    async fn sandbox_spawn_denied(sandbox: Arc<dyn Sandbox>) -> bool {
         let runner = SandboxedRunner::new(sandbox, RunLimits::default());
-        matches!(
-            runner
-                .run_command(CommandRequest {
-                    command: "true".to_string(),
-                    cwd: None,
-                })
-                .await,
-            Err(e) if e.to_string().contains("Operation not permitted")
-        )
-    }
-
-    /// Skip guard for the real-process sandbox tests (see
-    /// [`host_denies_sandbox_spawn`]): `true` when the host refuses sandbox
-    /// spawns and the kernel-enforced assertion cannot be exercised.
-    #[cfg(unix)]
-    async fn sandbox_spawn_denied() -> bool {
-        if host_denies_sandbox_spawn().await {
+        let denied = match runner
+            .run_command(CommandRequest {
+                command: "true".to_string(),
+                cwd: None,
+            })
+            .await
+        {
+            Err(e) => {
+                let message = e.to_string();
+                message.contains("Operation not permitted") || message.contains("failed to start")
+            }
+            Ok(_) => false,
+        };
+        if denied {
             eprintln!(
-                "host denies sandbox spawns (EPERM — e.g. GitHub-hosted runners); \
-                 skipping kernel-enforced assertion"
+                "host denies sandbox spawns (EPERM or a broken wrapper — e.g. GitHub-hosted \
+                 runners); skipping kernel-enforced assertion"
             );
-            true
-        } else {
-            false
         }
+        denied
     }
 
     #[test]
@@ -995,9 +1043,6 @@ mod tests {
         // Resource governance: a configured tool memory cap must be
         // enforced by the backend's child rlimits (`ulimit -v` finite), on
         // whatever Linux tier best-effort selects.
-        if sandbox_spawn_denied().await {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let limits = RunLimits {
             memory_limit_bytes: Some(16 * 1024 * 1024),
@@ -1005,6 +1050,9 @@ mod tests {
         };
         let sandbox = construct(SandboxMode::BestEffort, dir.path(), &limits)
             .expect("best-effort always constructs on linux");
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner = SandboxedRunner::new(sandbox, limits);
 
         let out = runner
@@ -1026,8 +1074,13 @@ mod tests {
         );
     }
 
+    /// `bwrap` has no rlimit options (any `--rlimit…` spelling exits with
+    /// `Unknown option`), so the caps ride in the payload: a `ulimit`
+    /// preamble that execs the real command. Unsupported flags must never
+    /// reach `bwrap` or it would refuse to start.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn bwrap_wrap_carries_the_memory_rlimit() {
+    fn bwrap_payload_carries_the_memory_rlimit() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = LinuxBwrap::new(dir.path().to_path_buf(), 60, 1024)
             .with_memory_limit(Some(8 * 1024 * 1024));
@@ -1037,24 +1090,90 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        assert!(
+            !args.iter().any(|a| a.starts_with("--rlimit")),
+            "bwrap takes no rlimit options: {args:?}"
+        );
+        let script = args
+            .iter()
+            .find(|a| a.contains("ulimit"))
+            .expect("payload must lower the limits");
+        assert!(script.contains("ulimit -t 60"), "{script}");
+        assert!(
+            script.contains("ulimit -f 2"),
+            "1024 bytes = 2 blocks: {script}"
+        );
+        assert!(script.contains("ulimit -n 256"), "{script}");
+        assert!(
+            script.contains("ulimit -v 8192"),
+            "8 MiB = 8192 KiB: {script}"
+        );
+        assert!(script.contains("exec \"$@\""), "{script}");
         let pos = args
-            .windows(2)
-            .position(|w| w[0] == "--rlimit" && w[1] == "AS");
-        assert!(pos.is_some(), "bwrap args must carry --rlimit AS: {args:?}");
-        assert_eq!(args[pos.unwrap() + 2], "8388608");
+            .iter()
+            .position(|a| a == "kern-ulimit")
+            .expect("payload argv[0] placeholder");
+        assert_eq!(args[pos + 1], "sh");
+    }
+
+    /// Without a configured memory cap the payload must not touch address
+    /// space (an unrequested limit could break legitimate builds).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_payload_omits_address_space_without_a_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = LinuxBwrap::new(dir.path().to_path_buf(), 30, 4096);
+        let (_, args) = sandbox.wrap(OsStr::new("true"), &[]).unwrap();
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "--unshare-all"));
+        assert!(args.iter().any(|a| a == "--die-with-parent"));
+        assert!(args.iter().all(|a| !a.contains("ulimit -v")), "{args:?}");
+        assert!(args.iter().any(|a| a.contains("ulimit -t 30")));
+    }
+
+    /// A wrapper that exits before running the command must be an error, not
+    /// an empty result that looks like the command ran and printed nothing.
+    #[test]
+    fn wrapper_startup_failure_is_reported() {
+        let broken = CommandOutput {
+            stdout: String::new(),
+            stderr: "bwrap: Unknown option --rlimit\n".to_string(),
+            code: Some(1),
+        };
+        let message = wrapper_startup_failure("bwrap", &broken).expect("must be reported");
+        assert!(message.contains("bwrap failed to start"), "{message}");
+        assert!(message.contains("Unknown option"), "{message}");
+
+        // The command itself failing is ordinary output, not a broken sandbox.
+        let failing_command = CommandOutput {
+            stdout: String::new(),
+            stderr: "sh: 1: nope: not found\n".to_string(),
+            code: Some(127),
+        };
+        assert!(wrapper_startup_failure("/bin/sh", &failing_command).is_none());
+        let ok = CommandOutput {
+            stdout: "done".to_string(),
+            stderr: String::new(),
+            code: Some(0),
+        };
+        assert!(wrapper_startup_failure("bwrap", &ok).is_none());
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn rlimit_fallback_applies_limits_to_real_processes() {
-        // Probe the actual child limits through the rlimit backend: `ulimit`
-        // must report finite values, not "unlimited".
-        if sandbox_spawn_denied().await {
-            return;
-        }
+        // Probe the actual child limits through the backend best-effort
+        // selects (bwrap on CI): `ulimit` must report finite values, not
+        // "unlimited".
         let dir = tempfile::tempdir().unwrap();
         let sandbox = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
             .expect("best-effort always constructs on linux");
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner = SandboxedRunner::new(sandbox, RunLimits::default());
 
         let out = runner
@@ -1081,12 +1200,12 @@ mod tests {
     async fn sandboxed_shell_tool_runs_commands() {
         // End-to-end: the sandboxed runner behind the shell tool. Uses
         // best-effort (rlimits on this box), so this runs everywhere.
-        if sandbox_spawn_denied().await {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let sandbox = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
             .expect("best-effort always constructs on linux");
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner: Arc<dyn CommandRunner> =
             Arc::new(SandboxedRunner::new(sandbox, RunLimits::default()));
         let tool = ShellTool::new(runner);
@@ -1108,6 +1227,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
             .expect("best-effort always constructs on linux");
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner = SandboxedRunner::new(
             sandbox,
             RunLimits {
@@ -1115,9 +1237,6 @@ mod tests {
                 ..RunLimits::default()
             },
         );
-        if sandbox_spawn_denied().await {
-            return;
-        }
         let err = runner
             .run_command(CommandRequest {
                 command: "sleep 30".to_string(),
@@ -1145,14 +1264,14 @@ mod tests {
     async fn tool_env_is_scrubbed_of_secrets() {
         // Unique name: never collides with a real variable, and parallel
         // tests cannot interfere (each uses its own key).
-        if sandbox_spawn_denied().await {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
+            .expect("best-effort always constructs");
+        if sandbox_spawn_denied(sandbox.clone()).await {
             return;
         }
         const SECRET: &str = "KERN_TEST_TOOL_SECRET_XYZ";
         std::env::set_var(SECRET, "super-secret-value");
-        let dir = tempfile::tempdir().unwrap();
-        let sandbox = construct(SandboxMode::BestEffort, dir.path(), &RunLimits::default())
-            .expect("best-effort always constructs");
         let runner = SandboxedRunner::new(sandbox, RunLimits::default());
 
         let out = runner
@@ -1183,14 +1302,14 @@ mod tests {
             eprintln!("landlock unavailable on this kernel; skipping");
             return;
         }
-        if sandbox_spawn_denied().await {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
-        let sandbox = Arc::new(
+        let sandbox: Arc<dyn Sandbox> = Arc::new(
             LinuxLandlock::new(ws.clone(), 60, 16 * 1024 * 1024, 512).expect("mask probe ok"),
         );
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner = SandboxedRunner::new(sandbox, RunLimits::default());
 
         // Inside the workspace: allowed.
@@ -1262,14 +1381,14 @@ mod tests {
             eprintln!("landlock unavailable on this kernel; skipping");
             return;
         }
-        if sandbox_spawn_denied().await {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
-        let sandbox = Arc::new(
+        let sandbox: Arc<dyn Sandbox> = Arc::new(
             LinuxLandlock::new(ws.clone(), 60, 16 * 1024 * 1024, 512).expect("mask probe ok"),
         );
+        if sandbox_spawn_denied(sandbox.clone()).await {
+            return;
+        }
         let runner = SandboxedRunner::new(sandbox, RunLimits::default());
         let out = runner
             .run_command(CommandRequest {
