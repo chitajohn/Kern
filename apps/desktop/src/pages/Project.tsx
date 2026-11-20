@@ -1,28 +1,6 @@
 import { useParams } from "react-router-dom";
-
-const board = [
-  {
-    name: "researcher",
-    task: "Map the engine loop",
-    state: "running",
-    branch: "kern/researcher-8f2",
-    progress: 62,
-  },
-  {
-    name: "builder",
-    task: "Add project model",
-    state: "waiting",
-    branch: "kern/builder-1c9",
-    progress: 28,
-  },
-  {
-    name: "reviewer",
-    task: "Review PR #2",
-    state: "idle",
-    branch: "kern/reviewer-4d1",
-    progress: 0,
-  },
-];
+import { StateChip } from "../components/StateChip";
+import { AGENTS, THREAD } from "../demo";
 
 export default function Project() {
   const { id } = useParams();
@@ -33,24 +11,28 @@ export default function Project() {
           <h1>{id}</h1>
           <p className="muted">3 worktrees · main · local</p>
         </div>
-        <button className="btn primary">New agent</button>
+        <button className="btn primary" type="button">
+          New agent
+        </button>
       </header>
 
       <div className="board">
-        {board.map((agent) => (
-          <article className="panel agent-card" key={agent.name}>
+        {AGENTS.map((agent) => (
+          <article className="panel agent-card" key={agent.id}>
             <div className="panel-head">
               <h2>{agent.name}</h2>
-              <span className={`dot ${agent.state}`} />
+              <StateChip state={agent.state} />
             </div>
             <p>{agent.task}</p>
-            <code>{agent.branch}</code>
-            <div className="bar">
+            <code className="branch">{agent.branch}</code>
+            <div className="meter">
               <span style={{ width: `${agent.progress}%` }} />
             </div>
             <div className="row between">
-              <small className="muted">{agent.state}</small>
-              <button className="btn ghost">Open</button>
+              <small className="muted">{agent.progress}% · 12 tool calls</small>
+              <button className="btn ghost" type="button">
+                Open
+              </button>
             </div>
           </article>
         ))}
@@ -62,16 +44,16 @@ export default function Project() {
           <span className="pill">researcher</span>
         </div>
         <div className="thread">
-          <div className="msg user">Find where checkpoints are written.</div>
-          <div className="msg agent">
-            Reading <code>crates/kern-core/src/checkpoint.rs</code> and the engine loop.
-            <div className="tool">
-              tool · filesystem.read <span className="ok">ok</span>
+          {THREAD.map((message, index) => (
+            <div className={`msg ${message.role}`} key={index}>
+              {message.text}
+              {message.tool && (
+                <div className="tool">
+                  tool · {message.tool.name} <span className="ok">{message.tool.result}</span>
+                </div>
+              )}
             </div>
-          </div>
-          <div className="msg agent">
-            Checkpoints are committed in <code>CheckpointStore::save</code> after every safe point.
-          </div>
+          ))}
         </div>
       </section>
     </div>

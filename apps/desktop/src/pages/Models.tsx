@@ -1,30 +1,32 @@
 import { MODELS, SPEEDS } from "../catalog";
+import { HoursMeter } from "../components/HoursMeter";
+import { HOURS_LEFT } from "../demo";
 
 export default function Models() {
   return (
     <div className="page">
       <header className="page-head">
         <div>
-          <h1>Models &amp; Hours</h1>
-          <p className="muted">Free models by default. Frontier at cost. No daily cap.</p>
+          <h1>Models &amp; hours</h1>
+          <p className="muted">No daily cap. Free models by default, frontier at cost.</p>
         </div>
-        <div className="hours big">
-          <span>4h 12m</span>
-          <small>remaining today</small>
-        </div>
+        <HoursMeter minutes={HOURS_LEFT} speed="slow" />
       </header>
 
       <section className="panel">
         <div className="panel-head">
           <h2>Speed</h2>
-          <span className="muted">How long an hour lasts</span>
+          <span className="muted">How long one build hour lasts</span>
         </div>
         <div className="grid three">
           {SPEEDS.map((speed) => (
             <div className="speed-card" key={speed.id}>
-              <strong>{speed.label}</strong>
+              <div className="row between">
+                <strong>{speed.label}</strong>
+                <span className="pill">{speed.burn}×</span>
+              </div>
               <span className="big-num">{speed.minutes}m</span>
-              <small>burn {speed.burn}×</small>
+              <small className="muted">per build hour</small>
             </div>
           ))}
         </div>
@@ -33,7 +35,9 @@ export default function Models() {
       <section className="panel">
         <div className="panel-head">
           <h2>Catalog</h2>
-          <button className="btn ghost">Bring your own key</button>
+          <button className="btn ghost" type="button">
+            Bring your own key
+          </button>
         </div>
         <table className="table">
           <thead>

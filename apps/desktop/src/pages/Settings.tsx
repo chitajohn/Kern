@@ -23,7 +23,9 @@ export default function Settings() {
           </div>
           <div className="setting">
             <span>Frontier keys</span>
-            <button className="btn ghost">Add key</button>
+            <button className="btn ghost" type="button">
+              Add key
+            </button>
           </div>
         </section>
 
@@ -33,11 +35,11 @@ export default function Settings() {
           </div>
           <div className="setting">
             <span>Theme</span>
-            <span>Dark</span>
+            <span>Ink</span>
           </div>
           <div className="setting">
             <span>Updates</span>
-            <span className="pill good">Automatic</span>
+            <span className="pill good">automatic</span>
           </div>
           <div className="setting">
             <span>Version</span>
