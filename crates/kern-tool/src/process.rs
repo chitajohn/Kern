@@ -563,6 +563,29 @@ mod tests {
     async fn background_grandchild_is_killed_on_timeout_windows() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
+        // PowerShell's first start on a cold runner can take several seconds
+        // (module discovery, Defender scanning). Pay that outside the timed
+        // run, otherwise the timeout can fire before the pid is published and
+        // the assertion below has nothing to check — the flake seen on
+        // windows-latest.
+        let warm = dir.path().join("warm.pid");
+        let warmup = format!(
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','2','127.0.0.1' \
+             -NoNewWindow -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; \
+             Wait-Process -Id $p.Id",
+            warm.display()
+        );
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("powershell")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(&warmup)
+            .status()
+            .expect("warm-up PowerShell must run");
+        assert!(status.success(), "warm-up run failed: {status:?}");
+
         // `-NoNewWindow` keeps Start-Process on the CreateProcess path, so
         // `ping` is a real child of PowerShell. `-WindowStyle` would route
         // through ShellExecute, and the shell (outside our job) would create it.
