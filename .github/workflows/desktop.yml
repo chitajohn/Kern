@@ -1,0 +1,47 @@
+name: Desktop
+
+on:
+  push:
+    branches: [feat/desktop-shell, main]
+    paths:
+      - "apps/desktop/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Install frontend
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build .exe
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+          args: --target x86_64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kern-windows-x64
+          path: apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
