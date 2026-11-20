@@ -1222,6 +1222,7 @@ preserves data.
 | D29 | Supervision: runner-liveness supervision — `Engine::supervisor_sweep` (15s cadence, 60s grace, daemon-wired) fails `starting\|running\|waiting` agents whose runner is gone with `RUNNER_LOST` instead of leaving them stuck forever; lifecycle amendment `waiting → failed` (SPEC §3.2); store files (db/wal/shm/lock) restricted to 0600 on Unix |
 | D30 | Durable wake/sleep — schema v4 (`executions.wake_at`), `sleeping` lifecycle state with `running → sleeping` (park) and `sleeping → running/failed/terminated` transitions, `agent.sleeping` catalog event, `runtime.durable_sleep_min` config (default 10s), runner-unloaded sleeps whose terminal result is replayed on wake; the scheduler’s `wake_due_once`/`reconcile_sleeping` and the timer cadence consume `soonest_wake_at`; the wake path shares `prepare_resume`/`spawn_resumed` with recovery and manual resume; the supervisor excludes `sleeping` |
 | D31 | Fault injection — `crate::fault` + `Store::open_with_faults` (test-only; production cost is one `Option` check per store write) make every recovery-relevant persisted write an injectable point, proven by the matrix test (`tests/fault_injection.rs`): no hang, valid lifecycle state, structured observable failure, monotonic events, exactly-once per recorded tool row, at-least-once only across the documented terminal-row-write window. The harness surfaced two recovery defects: a pre-start storage failure left the execution `pending` and locked the agent out (`EXECUTION_ALREADY_ACTIVE`) — `Lifecycle::fail`/`spawn_and_wait` now fail the pending row with events; and a fully-expired ask batch killed the run with an invalid `waiting → completed` transition — the park resolution unparks a still-`waiting` agent (CAS-guarded, `agent.resumed`), so expired ≡ denied per SPEC §8.1 and the run completes. `runtime.tool_memory_limit_mb` → `RLIMIT_AS` on every Linux sandbox tier (bwrap/landlock/rlimit) so the memory boundary does not depend on the installed backend |
+| D32 | Sandbox portability and loud failure — `bwrap` has no rlimit options at all: every `--rlimit…` spelling (generic `--rlimit NAME VALUE` and the per-resource `--rlimit-as`/`-cpu`/`-fsize`/`-nofile` we assumed) is answered with `Unknown option`, and `bwrap` exits before running anything. The caps now ride in the payload — a `sh -c 'ulimit -t …; ulimit -f …; ulimit -n …; [ulimit -v …;] exec "$@"'` preamble inside the sandbox — so every build gets them, lowering is always permitted, and `exec` keeps the limits that the command cannot raise back. Wrapper startup failures (`bwrap: …`/`sandbox-exec: …` on stderr, non-zero, empty stdout) now fail the tool call with `SANDBOX_FAILURE` instead of returning an empty successful `CommandOutput` — the host-restricted CI runner made a broken sandbox look like a silent command. Host-denied-spawn guards in the sandbox and shell-tool tests probe the exact backend under test and recognize the new error, so kernel-enforced assertions skip on hosts that refuse them while staying asserted everywhere else |
 
 ---
 
@@ -1280,9 +1281,9 @@ recorded terminal-failed with the expiry reason and the run completes.
 
 `runtime.tool_memory_limit_mb` (per-agent, absent = unlimited, an explicit operator
 choice) flows to `RunLimits.memory_limit_bytes` and is enforced as `RLIMIT_AS` by
-every Linux sandbox tier — bwrap (`--rlimit AS`), the Landlock backend, and the
-rlimit fallback — so the resource boundary does not depend on which backend is
-installed. Proven by a real-process test: `ulimit -v` inside the sandbox equals the
+every Linux sandbox tier — bwrap (`ulimit -v` in the sandbox payload), the Landlock
+backend, and the rlimit fallback — so the resource boundary does not depend on which
+backend is installed. Proven by a real-process test: `ulimit -v` inside the sandbox equals the
 configured cap. Network isolation still requires bwrap; per-execution cgroup
 accounting remains post-v0.1.
 
